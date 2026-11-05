@@ -21,6 +21,7 @@ pub mod auth;
 pub mod backup;
 pub mod catena;
 pub mod causal_vocab;
+pub mod compact_hint_memory;
 pub mod config;
 pub mod constants;
 pub mod contrastive;
