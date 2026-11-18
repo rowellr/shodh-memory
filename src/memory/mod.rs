@@ -7496,6 +7496,11 @@ impl MemorySystem {
         let mut applied = 0;
 
         for boost in boosts {
+            // Promotion boosts are disabled (constants are 0.0); skip entirely so a
+            // promotion does not rewrite the row and record a no-op event.
+            if boost.boost <= 0.0 {
+                continue;
+            }
             let memory_id = match uuid::Uuid::parse_str(&boost.memory_id) {
                 Ok(uuid) => MemoryId(uuid),
                 Err(_) => continue,

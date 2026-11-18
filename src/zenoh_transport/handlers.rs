@@ -392,7 +392,8 @@ pub async fn handle_remember(sample: Sample, manager: Arc<MultiUserMemoryManager
         content: req.content.clone(),
         experience_type,
         entities: merged_entities.clone(),
-        tags: merged_entities,
+        // Declared tags only; extracted entities stay in `entities`.
+        tags: req.tags.clone(),
         context,
         ner_entities,
         // Robotics fields — flow through from Zenoh publisher to stored Experience

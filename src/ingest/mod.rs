@@ -292,8 +292,12 @@ pub async fn ingest_experience(
     let toponyms = crate::gazetteer::resolve_ner_locations(&ner_entities);
     let declared_entities = crate::handlers::remember::declared_entities_from(&tags);
 
-    experience.entities = merged_entities.clone();
-    experience.tags = merged_entities;
+    experience.entities = merged_entities;
+    // Tags carry only what the caller asserted. The merged set (caller tags +
+    // NER surfaces + YAKE keyphrases) lives in `entities`, which the BM25
+    // entities field and the graph already read; copying it into tags put
+    // duplicate keywords into every row and into every prompt that renders them.
+    experience.tags = tags.to_vec();
     experience.declared_entities = declared_entities;
     experience.ner_entities = ner_entities;
     experience.toponyms = toponyms;

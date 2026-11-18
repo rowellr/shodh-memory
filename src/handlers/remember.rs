@@ -821,7 +821,10 @@ pub async fn batch_remember(
             content: item.content,
             experience_type,
             entities: merged_entities.clone(),
-            tags: merged_entities,
+            // Tags hold only what the caller declared. Extracted entities stay in
+            // `entities` (and therefore in the BM25 entities field and the graph);
+            // copying them into tags duplicated keywords already present in content.
+            tags: item.tags.clone(),
             declared_entities,
             context,
             ner_entities: ner_records,
@@ -1016,7 +1019,9 @@ pub async fn upsert_memory(
         content: req.content.clone(),
         experience_type,
         entities: merged_entities.clone(),
-        tags: merged_entities,
+        // Declared tags only; extracted entities live in `entities` for the BM25
+        // entities field and the graph (see the batch path above).
+        tags: req.tags.clone(),
         declared_entities,
         ner_entities,
         toponyms,

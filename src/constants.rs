@@ -974,21 +974,18 @@ pub const POTENTIATION_ACCESS_THRESHOLD: u32 = 3;
 // =============================================================================
 
 /// When an edge promotes L1→L2, boost the source memory's importance by this amount.
-/// Rationale: episodic consolidation signals genuine utility.
 ///
-/// Justification:
-/// - 0.015 is ~3x the per-cycle potentiation boost (0.005)
-/// - L1→L2 promotion means the edge survived initial decay — meaningful signal
-/// - Small enough to avoid runaway inflation from many edges promoting simultaneously
-pub const EDGE_PROMOTION_MEMORY_BOOST_L2: f64 = 0.015;
+/// Deliberately 0.0: importance is a write-time judgement and retrieval scales
+/// score by it (`SCORING_IMPORTANCE_FLOOR + importance * SCORING_IMPORTANCE_RANGE`),
+/// so letting graph promotion keep adding to it drove every well-connected memory
+/// to 1.0 and flattened the ranking signal. Edge strength already records promotion.
+pub const EDGE_PROMOTION_MEMORY_BOOST_L2: f64 = 0.0;
 
 /// When an edge promotes L2→L3, boost the source memory's importance by this amount.
-/// Rationale: semantic permanence is a strong signal of value.
 ///
-/// Justification:
-/// - 0.03 is 2x the L1→L2 boost — semantic promotion is rarer and more significant
-/// - L2→L3 means the edge survived sustained use — memory is genuinely useful
-pub const EDGE_PROMOTION_MEMORY_BOOST_L3: f64 = 0.03;
+/// Deliberately 0.0 for the same reason as [`EDGE_PROMOTION_MEMORY_BOOST_L2`]:
+/// importance must not drift upward after the writer set it.
+pub const EDGE_PROMOTION_MEMORY_BOOST_L3: f64 = 0.0;
 
 /// When a memory loses all graph edges (orphaned), apply this compensatory boost.
 /// Prevents immediate decay death; gives the memory one more cycle to prove value.
