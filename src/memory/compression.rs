@@ -1258,9 +1258,15 @@ impl SemanticConsolidator {
         for marker in def_markers {
             if let Some(pos) = lower.find(marker) {
                 // Extract subject and definition
-                let subject_start =
-                    content[..pos].rfind(|c: char| !c.is_alphanumeric() && c != '_');
-                let subject_start = subject_start.map(|i| i + 1).unwrap_or(0);
+                // Step past the separator char by its UTF-8 width, not 1 byte:
+                // the boundary char can be multibyte (e.g. '★', '…') and a bare
+                // `i + 1` splits the string mid-char and panics the caller.
+                let subject_start = content[..pos]
+                    .char_indices()
+                    .rev()
+                    .find(|(_, c)| !c.is_alphanumeric() && *c != '_')
+                    .map(|(i, c)| i + c.len_utf8())
+                    .unwrap_or(0);
                 let subject = &content[subject_start..pos];
 
                 // Subject must be >= 3 chars (filter single-char and 2-char noise)
