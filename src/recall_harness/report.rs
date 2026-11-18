@@ -16,6 +16,191 @@ use super::metrics::Metrics;
 /// `k` value used by the L1 smoke suite for top-`k` metrics.
 pub const SMOKE_K: usize = 10;
 
+/// The `embedder` a report carries when the run could not say what embedded it. Its own
+/// value, never a plausible model name, so `compare_to_baseline` can refuse it.
+pub const EMBEDDER_UNKNOWN: &str = "unknown";
+
+/// Which family of kernels the runner's CPU makes ONNX Runtime compute with.
+///
+/// ONNX Runtime's MLAS picks its kernels by CPUID at load time, and no environment variable
+/// or session option pins the choice. Where the CPU exposes AVX-512F it swaps the fp32 GEMM,
+/// exp and max-reduction kernels (`GemmFloatKernel` Fma3 → Avx512F, and the softmax /
+/// LayerNorm reductions) for ones that accumulate in a different order, so the same model on
+/// the same input gives different low bits. Measured on the CI fleet (runs 35901281838 and
+/// 35902501577): the MiniLM embedder drifts by up to 1.5e-8, GLiNER by up to 8 ULP, and the
+/// quantized cross-encoder by up to 0.06 in logit, enough to reorder near-ties.
+///
+/// AVX-512 is not one class. On the gate, a Xeon Platinum 8573C and a Xeon 6973P-C, both
+/// AVX-512 with VNNI, differ from each other on 6 cases (runs 35887740236 and 35982981356;
+/// the latter reproduces run 35894635781 on all 100 cases). The 6973P-C also exposes AMX,
+/// AVX512-FP16, AVX512-BF16 and AVX-VNNI. Which of those MLAS keys on was not isolated. So
+/// the class names every dispatch-relevant feature the CPU exposes: two machines share a
+/// class only if they expose the same set. Splitting too finely costs a re-run. Splitting
+/// too coarsely reports runner differences as regressions, which is the failure this
+/// exists to prevent.
+///
+/// The class is what the CPU *exposes*, not what the chip is. An EPYC 9V74 whose
+/// hypervisor hid AVX-512 produced the AVX2 class's results byte for byte.
+///
+/// `class` is the comparison key. `cpu_model` and `features` are recorded so a mismatch, or
+/// a divergence the class does not explain, can be traced to hardware from the report alone.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct KernelClass {
+    /// On x86_64, the base level MLAS dispatches on (`x86_64-avx512f`, `x86_64-avx2-fma`,
+    /// `x86_64-avx` or `x86_64-sse`), then `+feature` for every [`KERNEL_CLASS_EXTRAS`]
+    /// entry the CPU exposes, in that order. An AVX2 machine with none of them is plain
+    /// `x86_64-avx2-fma`. On other architectures, the architecture name: that split has not
+    /// been measured there, and nothing gates on those machines.
+    pub class: String,
+    /// `model name` from `/proc/cpuinfo`, or empty where that file does not exist.
+    pub cpu_model: String,
+    /// The dispatch-relevant CPU features the runner exposes, in probe order.
+    pub features: Vec<String>,
+}
+
+/// Features beyond the base level that name a separate class, in class-name order. Kept in
+/// step with the `Check runner CPU kernel class` step in `.github/workflows/recall.yml`,
+/// which derives the same name from `/proc/cpuinfo` (where the spellings differ:
+/// `avx512_vnni`, `amx_int8`, ...). That workflow checks the two names agree on every run.
+pub const KERNEL_CLASS_EXTRAS: [&str; 10] = [
+    "avx512bw",
+    "avx512dq",
+    "avx512vl",
+    "avx512vnni",
+    "avx512bf16",
+    "avx512fp16",
+    "avxvnni",
+    "amx-tile",
+    "amx-int8",
+    "amx-bf16",
+];
+
+/// The class name for a set of exposed x86_64 features, using the names
+/// `is_x86_feature_detected!` uses.
+pub fn class_from_features(features: &[&str]) -> String {
+    let has = |f: &str| features.contains(&f);
+    let mut class = if has("avx512f") {
+        "x86_64-avx512f"
+    } else if has("avx2") && has("fma") {
+        "x86_64-avx2-fma"
+    } else if has("avx") {
+        "x86_64-avx"
+    } else {
+        "x86_64-sse"
+    }
+    .to_string();
+    for extra in KERNEL_CLASS_EXTRAS {
+        if has(extra) {
+            class.push('+');
+            class.push_str(extra);
+        }
+    }
+    class
+}
+
+/// The cross-encoder setting a run measured under.
+///
+/// Reranking is off in the library and on in the server (#562), and it moves p@1 by about
+/// 15pp on the gate. The workflow's `ce_rerank=0` dispatch measures the library default on
+/// purpose. Compared against the reranked baseline, that run reads as a large regression
+/// that no code change caused. Depth decides which candidates the reranker sees, so two
+/// depths are two pipelines as well.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RerankSetting {
+    /// `SHODH_CE_RERANK` as `recall()` reads it.
+    pub enabled: bool,
+    /// Candidates the reranker rescores (`SHODH_CE_DEPTH`). Recorded either way, but
+    /// only compared when both runs rerank: an unreranked run never reads it.
+    pub depth: usize,
+}
+
+impl RerankSetting {
+    /// The setting `recall()` will run under in this process.
+    pub fn current() -> Self {
+        Self {
+            enabled: crate::memory::ce_rerank_enabled(),
+            depth: crate::memory::ce_depth(),
+        }
+    }
+
+    fn describe(&self) -> String {
+        if self.enabled {
+            format!("cross-encoder on, depth {}", self.depth)
+        } else {
+            "cross-encoder off".to_string()
+        }
+    }
+}
+
+impl KernelClass {
+    /// Detect the class of the machine this process runs on.
+    pub fn detect() -> Self {
+        let (class, features) = Self::detect_class_and_features();
+        Self {
+            class,
+            cpu_model: Self::cpu_model(),
+            features,
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn detect_class_and_features() -> (String, Vec<String>) {
+        // `is_x86_feature_detected!` checks both CPUID and that the OS saves the
+        // register state (XGETBV), which is the condition MLAS applies before taking
+        // an AVX or AVX-512 path.
+        let mut probes = vec![
+            ("avx", std::is_x86_feature_detected!("avx")),
+            ("avx2", std::is_x86_feature_detected!("avx2")),
+            ("fma", std::is_x86_feature_detected!("fma")),
+            ("avx512f", std::is_x86_feature_detected!("avx512f")),
+            ("avx512bw", std::is_x86_feature_detected!("avx512bw")),
+            ("avx512dq", std::is_x86_feature_detected!("avx512dq")),
+            ("avx512vl", std::is_x86_feature_detected!("avx512vl")),
+            ("avx512vnni", std::is_x86_feature_detected!("avx512vnni")),
+            ("avx512bf16", std::is_x86_feature_detected!("avx512bf16")),
+            ("avx512fp16", std::is_x86_feature_detected!("avx512fp16")),
+            ("avxvnni", std::is_x86_feature_detected!("avxvnni")),
+        ];
+        // AMX detection is still unstable in `is_x86_feature_detected!`, so read CPUID
+        // leaf 7 directly: EDX bit 22 is AMX-BF16, 24 AMX-TILE, 25 AMX-INT8. This does
+        // not check that the OS enabled the tile state. That only matters if a kernel
+        // hides AMX that the CPU has, and then the class splits finer than needed,
+        // which costs a re-run and never a false comparison.
+        let edx = if core::arch::x86_64::__cpuid(0).eax >= 7 {
+            core::arch::x86_64::__cpuid_count(7, 0).edx
+        } else {
+            0
+        };
+        probes.push(("amx-tile", edx & (1 << 24) != 0));
+        probes.push(("amx-int8", edx & (1 << 25) != 0));
+        probes.push(("amx-bf16", edx & (1 << 22) != 0));
+        let features: Vec<String> = probes
+            .iter()
+            .filter(|(_, on)| *on)
+            .map(|(n, _)| (*n).to_string())
+            .collect();
+        let names: Vec<&str> = features.iter().map(String::as_str).collect();
+        (class_from_features(&names), features)
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn detect_class_and_features() -> (String, Vec<String>) {
+        (std::env::consts::ARCH.to_string(), Vec::new())
+    }
+
+    fn cpu_model() -> String {
+        std::fs::read_to_string("/proc/cpuinfo")
+            .ok()
+            .and_then(|info| {
+                info.lines()
+                    .find(|l| l.starts_with("model name"))
+                    .and_then(|l| l.split_once(':'))
+                    .map(|(_, v)| v.trim().to_string())
+            })
+            .unwrap_or_default()
+    }
+}
+
 /// Top-level recall-eval report.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Report {
@@ -23,6 +208,23 @@ pub struct Report {
     pub suite: String,
     /// Embedding model name, e.g. `"minilm-l6-v2"`.
     pub embedder: String,
+    /// The CPU kernel class the run computed on. Reports written before this field existed
+    /// parse with an empty class, which [`compare_to_baseline`] refuses: nobody can say
+    /// which class produced them.
+    #[serde(default)]
+    pub kernel: KernelClass,
+    /// Whether the run reranked with the cross-encoder, and at what depth. `None` on
+    /// reports written before this field existed, which [`compare_to_baseline`] refuses:
+    /// "not recorded" is not the same as "off".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank: Option<RerankSetting>,
+    /// sha256 of the model tape the run replayed its model outputs from, or `None` when
+    /// the models ran live (see `crate::embeddings::model_tape`). Two runs that replayed
+    /// the same tape saw byte-identical model outputs, so the CPU they ran on no longer
+    /// matters; a live run and a replayed one, or two different tapes, are two sets of
+    /// model outputs and [`compare_to_baseline`] refuses them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_tape: Option<String>,
     /// Git SHA of the working tree the run was produced from.
     pub git_sha: String,
     /// RFC3339 timestamp at the start of the run.
@@ -44,6 +246,78 @@ pub struct Report {
     pub repeats: usize,
     /// Cases or metrics that failed validation or regression.
     pub failures: Vec<Failure>,
+    /// Per-stage latency breakdown. `None` unless `SHODH_STAGE_TIMING=1`.
+    ///
+    /// Omitted from the JSON entirely when absent, so committed baselines
+    /// written without it stay byte-identical and still parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_timing: Option<StageTimingReport>,
+}
+
+/// One pipeline stage's latency distribution across the suite.
+///
+/// Percentiles are computed the same way the headline latency is: per case, take
+/// the median across repeats; then take percentiles across cases. That makes a
+/// stage row directly comparable to `latency_p50_ms` and immune to a single
+/// noisy repeat.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct StageRow {
+    /// Stage name, in pipeline order.
+    pub stage: String,
+    pub p50_ms: f64,
+    pub p95_ms: f64,
+    pub p99_ms: f64,
+    /// Arithmetic mean across cases.
+    pub mean_ms: f64,
+    /// `mean_ms` as a percentage of the mean end-to-end latency.
+    ///
+    /// Shares are computed from MEANS, not percentiles, because means are
+    /// additive and percentiles are not: the per-stage p50s have no obligation
+    /// to sum to the end-to-end p50, but the per-stage means do sum to the mean
+    /// stage total. Use `p50_ms` for "how long does this stage take", and
+    /// `mean_share_pct` for "how much of the budget does it own".
+    pub mean_share_pct: f64,
+}
+
+/// Per-stage latency breakdown for one `LayerMode`.
+///
+/// Emitted only under `SHODH_STAGE_TIMING=1`. The reconciliation fields exist so
+/// a reader can check the breakdown against the wall clock instead of trusting
+/// it: `unattributed_mean_ms` is end-to-end minus the sum of the seven stages,
+/// and a large value means a boundary is in the wrong place.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct StageTimingReport {
+    /// Which `LayerMode` these timings came from.
+    pub mode: String,
+    pub case_count: usize,
+    pub repeats: usize,
+    /// End-to-end wall clock as measured by the harness around `recall()`.
+    /// Identical in construction to the report's `latency_p50_ms`.
+    pub e2e_p50_ms: f64,
+    pub e2e_p95_ms: f64,
+    pub e2e_mean_ms: f64,
+    /// Mean of (sum of the seven top-level stages).
+    pub stage_sum_mean_ms: f64,
+    /// `e2e_mean_ms - stage_sum_mean_ms`: time inside `recall()` but outside any
+    /// instrumented stage (the wrapper, lock acquisition, probe overhead).
+    pub unattributed_mean_ms: f64,
+    /// The seven top-level stages, in pipeline order. These partition
+    /// `stage_sum_mean_ms`.
+    pub stages: Vec<StageRow>,
+    /// Sub-stages carved out of the rows above. These OVERLAP `stages` and must
+    /// not be added to it: `tokenize`/`onnx_forward` ⊂ `embedding`, `bm25` ⊂
+    /// `fusion`, `fetch` ⊂ `scoring`. `storage_read`/`storage_decode` are
+    /// recall-wide — `MemoryStorage::get` is called from the graph traversal as
+    /// well as Layer 5, and measurement put nearly all of it in the former.
+    pub substages: Vec<StageRow>,
+    /// Mean ONNX forward passes per query. 0 = query-cache hit; 2 = the
+    /// polarity-sensitive path also embedded the negated form.
+    pub mean_forwards: f64,
+    /// Mean `recall_inner` invocations per `recall()`. > 1 means the companion
+    /// re-rank fired and issued a nested deep recall.
+    pub mean_inner_recalls: f64,
+    /// Mean cold RocksDB reads per query (Layer-5 cache misses).
+    pub mean_storage_reads: f64,
 }
 
 fn default_repeats() -> usize {
@@ -229,6 +503,65 @@ pub struct AblationRow {
     /// Per-category recall@10 (category name → value), so a config that helps one
     /// capability but hurts another is visible, not hidden in the average.
     pub by_category_recall: std::collections::BTreeMap<String, f64>,
+    /// Order-sensitive fingerprint of every id this arm retrieved, across every
+    /// case. Two arms with the same fingerprint returned byte-identical results.
+    #[serde(default)]
+    pub retrieval_fingerprint: u64,
+    /// True when this arm's fingerprint equals its REFERENCE arm's, i.e. the
+    /// flags it adds provably changed nothing and its delta is attributable to
+    /// nothing. The `+spread-fix` arms were vacuous this way for months: the flag
+    /// they set could not reach the live code path, so the rows silently
+    /// duplicated baseline while reading as evidence.
+    #[serde(default)]
+    pub vacuous_vs_reference: bool,
+    /// The arm this one is measured against; `None` only for the baseline. Every
+    /// other arm is its reference plus the flags it adds, so its delta belongs
+    /// to exactly those flags. Cross-encoder arms reference the cross-encoder
+    /// baseline rather than the shipped one, so "what does BM25 add once the
+    /// reranker is in" is not confounded with "what does the reranker add".
+    #[serde(default)]
+    pub reference: Option<String>,
+    /// Paired difference in recall@10 against `reference`, with a 95% bootstrap
+    /// interval over cases.
+    #[serde(default, rename = "delta_recall@10")]
+    pub delta_recall_at_10: Option<DeltaCi>,
+    /// Paired difference in p@1 against `reference`, with a 95% bootstrap
+    /// interval over cases.
+    #[serde(default, rename = "delta_p@1")]
+    pub delta_p_at_1: Option<DeltaCi>,
+    /// Every case's metrics under this arm, in suite order, so any two arms can
+    /// be re-compared offline with the pairing intact.
+    #[serde(default)]
+    pub per_case: Vec<AblationCaseRow>,
+}
+
+/// A paired difference between two arms: the mean over cases and its 95%
+/// percentile-bootstrap interval.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct DeltaCi {
+    pub mean: f64,
+    pub lo: f64,
+    pub hi: f64,
+}
+
+impl DeltaCi {
+    /// Whether the interval rules out "no effect". A delta whose interval
+    /// contains zero is not distinguishable from noise at this sample size,
+    /// however large its mean.
+    pub fn excludes_zero(&self) -> bool {
+        self.lo > 0.0 || self.hi < 0.0
+    }
+}
+
+/// One case's metrics under one ablation arm. Field names match the recall
+/// run's per-case output, so both files can be read by the same code.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AblationCaseRow {
+    pub case_id: String,
+    pub category: String,
+    pub recall_at_k: f64,
+    pub p_at_1: f64,
+    pub ndcg_at_k: f64,
 }
 
 /// Unified ablation report: one ingest, N query-time configs, one comparison
@@ -239,6 +572,13 @@ pub struct AblationReport {
     pub git_sha: String,
     pub case_count: usize,
     pub rows: Vec<AblationRow>,
+    /// Whether the baseline, re-run with no arm env after every arm, retrieved
+    /// byte-identical results to its first pass. `false` means an arm left
+    /// state behind or query-time retrieval is not deterministic on a fixed
+    /// ingest; either way it is noise under every delta. `None` when the matrix
+    /// had no baseline to replicate.
+    #[serde(default)]
+    pub baseline_replicate_identical: Option<bool>,
 }
 
 /// One layer's row in the E3 multi-hop ladder: recall@10 split by 2-hop
@@ -287,6 +627,16 @@ pub struct LayerReport {
     pub ndcg_at_10: f64,
     #[serde(rename = "recall@10")]
     pub recall_at_10: f64,
+    /// Hit-rate at 10: fraction of CASES with at least one gold in the top-10.
+    ///
+    /// Sits next to `recall_at_10`, which is the mean FRACTION of each case's
+    /// gold found. The two diverge sharply where gold is dense: 3.13 gold per
+    /// multi_hop case means two-of-three scores 0.67 on recall and 1.00 here,
+    /// while single_hop (1.06 gold/case) has them nearly coincide. Most published
+    /// memory/RAG "recall@k" numbers are this hit-rate form, so any external
+    /// comparison has to name which of the two it means.
+    #[serde(rename = "hit@10", default)]
+    pub hit_at_10: f64,
     #[serde(rename = "precision@10")]
     pub precision_at_10: f64,
     pub mrr: f64,
@@ -320,6 +670,16 @@ pub struct CategoryReport {
     pub ndcg_at_10: f64,
     #[serde(rename = "recall@10")]
     pub recall_at_10: f64,
+    /// Hit-rate at 10: fraction of CASES with at least one gold in the top-10.
+    ///
+    /// Sits next to `recall_at_10`, which is the mean FRACTION of each case's
+    /// gold found. The two diverge sharply where gold is dense: 3.13 gold per
+    /// multi_hop case means two-of-three scores 0.67 on recall and 1.00 here,
+    /// while single_hop (1.06 gold/case) has them nearly coincide. Most published
+    /// memory/RAG "recall@k" numbers are this hit-rate form, so any external
+    /// comparison has to name which of the two it means.
+    #[serde(rename = "hit@10", default)]
+    pub hit_at_10: f64,
     #[serde(rename = "precision@10")]
     pub precision_at_10: f64,
     pub mrr: f64,
@@ -427,6 +787,7 @@ pub fn aggregate_layer(per_case: &[Metrics], latencies_ms: &[f64]) -> LayerRepor
     LayerReport {
         ndcg_at_10: mean(|m| m.ndcg_at_k),
         recall_at_10: mean(|m| m.recall_at_k),
+        hit_at_10: mean(|m| m.hit_at_k),
         precision_at_10: mean(|m| m.precision_at_k),
         mrr: mean(|m| m.mrr),
         p_at_1: mean(|m| m.p_at_1),
@@ -454,6 +815,7 @@ pub fn aggregate_category(per_case: &[Metrics]) -> CategoryReport {
     CategoryReport {
         ndcg_at_10: mean(|m| m.ndcg_at_k),
         recall_at_10: mean(|m| m.recall_at_k),
+        hit_at_10: mean(|m| m.hit_at_k),
         precision_at_10: mean(|m| m.precision_at_k),
         mrr: mean(|m| m.mrr),
         p_at_1: mean(|m| m.p_at_1),
@@ -473,6 +835,121 @@ pub fn compare_to_baseline(
     current: &Report,
     tolerance_pct: f64,
 ) -> Vec<Failure> {
+    // A value nothing reads is not a check. Both reports carry `embedder`; a diff across two
+    // embedders is a diff of two systems, and calling its result a regression or an
+    // improvement describes neither. A report that cannot say what embedded it is not
+    // diffable against anything, including another unknown. Refuse before any metric.
+    for (which, e) in [
+        ("baseline", &baseline.embedder),
+        ("current", &current.embedder),
+    ] {
+        if e.is_empty() || e == EMBEDDER_UNKNOWN {
+            return vec![Failure {
+                kind: "infrastructure".to_string(),
+                detail: format!(
+                    "{which} report cannot say what embedded it (embedder {e:?}); a run of unknown \
+                     provenance is not diffable against anything"
+                ),
+            }];
+        }
+    }
+    if baseline.embedder != current.embedder {
+        return vec![Failure {
+            kind: "infrastructure".to_string(),
+            detail: format!(
+                "embedder differs: baseline {:?}, current {:?} — metrics from two embedders are \
+                 not comparable; record a new baseline under the current embedder instead",
+                baseline.embedder, current.embedder
+            ),
+        }];
+    }
+    // Where the model outputs came from. Replayed from one tape, they are byte-identical
+    // on any CPU, which is the only reason the class check below can be skipped. Anything
+    // else pairs two different sets of model outputs.
+    let replayed_same_tape = match (&baseline.model_tape, &current.model_tape) {
+        (Some(b), Some(c)) if b == c => true,
+        (None, None) => false,
+        (b, c) => {
+            let describe = |t: &Option<String>| match t {
+                Some(d) => format!("replayed from tape {}", &d[..d.len().min(12)]),
+                None => "computed live".to_string(),
+            };
+            return vec![Failure {
+                kind: "infrastructure".to_string(),
+                detail: format!(
+                    "model outputs differ: baseline {}, current {}. These are two sets of                      embeddings, entities and reranker scores, so their difference is not a                      change in the code. Compare against a baseline recorded from the same                      tape",
+                    describe(b),
+                    describe(c)
+                ),
+            }];
+        }
+    };
+    // Same reasoning one level down: identical code on the two CPU kernel classes gives
+    // different rankings (see `KernelClass`), so a case that moved across classes may have
+    // moved because of the runner, and nothing in the diff can say which. A report that does
+    // not record its class is refused for the same reason an unknown embedder is. Runs
+    // that replayed one tape are exempt: no model arithmetic ran, so the class had nothing
+    // to change.
+    for (which, k) in [("baseline", &baseline.kernel), ("current", &current.kernel)] {
+        if replayed_same_tape {
+            break;
+        }
+        if k.class.is_empty() {
+            return vec![Failure {
+                kind: "infrastructure".to_string(),
+                detail: format!(
+                    "{which} report does not record the CPU kernel class it ran on; results \
+                     differ across classes, so a run of unknown class is not diffable. \
+                     Regenerate the baseline as tests/recall/README.md describes"
+                ),
+            }];
+        }
+    }
+    if !replayed_same_tape && baseline.kernel.class != current.kernel.class {
+        return vec![Failure {
+            kind: "infrastructure".to_string(),
+            detail: format!(
+                "CPU kernel class differs: baseline {:?} ({}), current {:?} ({}). ONNX Runtime \
+                 picks its fp32 kernels by CPUID, so identical code ranks differently across \
+                 classes. Re-run the job until it lands on a {:?} runner",
+                baseline.kernel.class,
+                baseline.kernel.cpu_model,
+                current.kernel.class,
+                current.kernel.cpu_model,
+                baseline.kernel.class
+            ),
+        }];
+    }
+    let (base_rerank, cur_rerank) = match (baseline.rerank, current.rerank) {
+        (Some(b), Some(c)) => (b, c),
+        (b, _) => {
+            let which = if b.is_none() { "baseline" } else { "current" };
+            return vec![Failure {
+                kind: "infrastructure".to_string(),
+                detail: format!(
+                    "{which} report does not record whether it reranked with the \
+                     cross-encoder; the reranker moves p@1 by about 15pp, so a run of \
+                     unknown setting is not diffable. Regenerate the baseline as \
+                     tests/recall/README.md describes"
+                ),
+            }];
+        }
+    };
+    let depth_matters = base_rerank.enabled && cur_rerank.enabled;
+    if base_rerank.enabled != cur_rerank.enabled
+        || (depth_matters && base_rerank.depth != cur_rerank.depth)
+    {
+        return vec![Failure {
+            kind: "infrastructure".to_string(),
+            detail: format!(
+                "reranker setting differs: baseline {}, current {}. These are two \
+                 pipelines, so their difference is not a regression or an improvement \
+                 of either. Compare against a baseline recorded under the same setting",
+                base_rerank.describe(),
+                cur_rerank.describe()
+            ),
+        }];
+    }
     let Some(base_full) = baseline.layers.get("full") else {
         return vec![Failure {
             kind: "infrastructure".to_string(),
@@ -628,6 +1105,116 @@ pub struct GraphStructure {
     pub hub_threshold: usize,
     /// Top entity degrees, descending (the hub tail).
     pub top_degrees: Vec<usize>,
+    /// Co-occurrence edges never minted because an endpoint had already
+    /// saturated `SHODH_HUB_DEGREE_MAX`.
+    ///
+    /// The cap is a hard SKIP, not an eviction, and the condition is `||`: one
+    /// saturated endpoint kills the edge even when the other is rare and highly
+    /// discriminative. So which associations exist is decided by ingest ARRIVAL
+    /// ORDER, on a criterion uncorrelated with information — while the PMI-squared
+    /// gate beside it culls on exactly that criterion. A large number here means
+    /// the graph's shape is an artefact of ingest sequence.
+    #[serde(default)]
+    pub hub_saturation_skipped_edges: u64,
+
+    /// Stored edges by relation type, descending.
+    ///
+    /// The substrate scoreboard for typed path composition. A walk that carries
+    /// relation ORDER needs every hop of a path to name a real relation; a hop
+    /// through `CoOccurs` carries none, because co-occurrence is symmetric and
+    /// composing it with itself is the commutative case. So the typed share is
+    /// not bookkeeping, it bounds what a path grammar can express: at a typed
+    /// fraction p, a fully-typed k-hop path is about p^k of paths.
+    ///
+    /// Measured on the LoCoMo gate corpus this was 1.89% typed -- 215 edges of
+    /// 11,370, against 11,155 CoOccurs -- which makes a typed 2-hop path
+    /// roughly 0.04% and leaves composition nothing to walk. But LoCoMo is
+    /// casual dialogue, where "Hey, that hike sounds great" genuinely contains
+    /// no typed relation, so that number may say more about the corpus than
+    /// about the extractor. This field exists so the same question can be asked
+    /// of a DOCUMENT corpus, where the answer is likely different and where the
+    /// product actually runs.
+    #[serde(default)]
+    pub relation_types: BTreeMap<String, usize>,
+
+    /// Edges whose relation type carries direction and meaning, i.e. everything
+    /// except the symmetric association types. Counted here rather than derived
+    /// by the reader so the definition lives in one place.
+    #[serde(default)]
+    pub typed_edges: usize,
+
+    /// `CoOccurs`, `RelatedTo`, `AssociatedWith`, `CoRetrieved`, `WorksWith`,
+    /// `Knows`, `AlternativeTo` -- symmetric, so order across them is not
+    /// information. Derivable from entity->episode incidence rather than stored.
+    #[serde(default)]
+    pub symmetric_edges: usize,
+
+    /// Entity nodes by label, descending.
+    ///
+    /// Label-pair typing rules key off these, so a rule can be correct, enabled,
+    /// and still never fire because the labels it matches are not being
+    /// produced. Measured: `SHODH_PERSON_PERSON_KNOWS=1` yielded a
+    /// BYTE-IDENTICAL graph -- typed 215, generic 4815, pair_table 40, every
+    /// metric +0.0000 -- which is what a rule that never matches looks like.
+    /// Without this field there was no way to tell "the rule does nothing" from
+    /// "the rule never fired".
+    #[serde(default)]
+    pub entity_labels: BTreeMap<String, usize>,
+
+    /// Connected components of the FULL edge set: (count, largest as a fraction
+    /// of entities).
+    #[serde(default)]
+    pub components_all: (usize, f64),
+
+    /// Same, after deleting the top-N highest-degree entities, for N in
+    /// {1, 5, 10, 25}.
+    ///
+    /// A k-connected graph survives removal of k-1 vertices. If the graph
+    /// shatters once a handful of hubs go, its connectivity is HUB-CARRIED --
+    /// high edge count is not high connectivity. That matters twice: it is the
+    /// precondition for the Gyori-Lovasz partition theorem, and it says whether
+    /// the 94.8%-of-gold-within-one-hop figure is structure or a few
+    /// degree-301 nodes standing in the middle of everything.
+    #[serde(default)]
+    pub components_after_hub_removal: Vec<(usize, usize, f64)>,
+
+    /// Components of the TYPED-ONLY subgraph, plus how many entities are
+    /// isolated in it.
+    ///
+    /// The typed layer is the substrate any path automaton would walk. At mean
+    /// typed degree below 1 most entities may be isolated there, in which case
+    /// a grammar-guided walk has nothing to traverse for most queries -- worth
+    /// knowing BEFORE building the walker rather than after.
+    #[serde(default)]
+    pub typed_components: (usize, f64, usize),
+
+    /// Per-label degree census: label -> (entities, incidence sum, max degree).
+    ///
+    /// `entity_labels` says which labels EXIST; this says which ones carry the
+    /// graph's connectivity. The two come apart badly. A label can be 7% of
+    /// nodes and a third of all incidences, which is what a node type that
+    /// should have been an ATTRIBUTE looks like: "last weekend" is mentioned by
+    /// everything, so minting it as a node wires every memory that says it into
+    /// one star, and the star is not a relation anyone would query.
+    ///
+    /// An entity with two labels is counted under both, so the sums exceed the
+    /// entity and incidence totals. Read shares as per-label, not as a
+    /// partition.
+    #[serde(default)]
+    pub label_degrees: BTreeMap<String, (usize, usize, usize)>,
+
+    /// The 25 highest-degree entities: (name, labels, degree).
+    ///
+    /// Aggregates hide hubs. Per-label MEAN degree in particular understates
+    /// them, because degrees here are post-cap: an entity that saturated
+    /// `MAX_ENTITY_DEGREE` reports the cap while its overflow edges were
+    /// silently discarded at ingest, so the mean is an average over a censored
+    /// variable. The identities are what make a result legible -- "the top hub
+    /// is a date" and "the top hub is the user" are the same number and
+    /// opposite conclusions -- and degrees PINNED AT THE CAP in this list are
+    /// the actual tell for saturation.
+    #[serde(default)]
+    pub top_hubs: Vec<(String, String, usize)>,
 }
 
 /// Reachability tallies for one category (cumulative within-N-hops counts).
@@ -713,6 +1300,7 @@ mod tests {
             mrr: values,
             p_at_1: values,
             map: values,
+            hit_at_k: values,
         }
     }
 
@@ -767,6 +1355,7 @@ mod tests {
             LayerReport {
                 ndcg_at_10: ndcg,
                 recall_at_10: recall,
+                hit_at_10: recall,
                 precision_at_10: 0.2,
                 mrr,
                 p_at_1: p1,
@@ -782,6 +1371,16 @@ mod tests {
         Report {
             suite: "smoke".to_string(),
             embedder: "test".to_string(),
+            kernel: KernelClass {
+                class: "x86_64-avx2-fma".to_string(),
+                cpu_model: "AMD EPYC 7763 64-Core Processor".to_string(),
+                features: vec!["avx".into(), "avx2".into(), "fma".into()],
+            },
+            rerank: Some(RerankSetting {
+                enabled: true,
+                depth: 30,
+            }),
+            model_tape: None,
             git_sha: "deadbeef".to_string(),
             timestamp: chrono::Utc::now(),
             layers,
@@ -789,6 +1388,7 @@ mod tests {
             case_count: 30,
             repeats: 1,
             failures: vec![],
+            stage_timing: None,
         }
     }
 
@@ -825,6 +1425,336 @@ mod tests {
         assert!(compare_to_baseline(&baseline, &current, 2.0).is_empty());
     }
 
+    /// Two embedders, identical numbers: not a pass, not a regression, a refusal — and no
+    /// metric failure rides along with it.
+    #[test]
+    fn different_embedder_refuses_before_any_metric_is_compared() {
+        let baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+        let mut current = report_with_full(0.1, 0.1, 0.1, 0.1); // would fail every gate
+        current.embedder = "text-embedding-nomic-embed-text-v1.5".to_string();
+        let failures = compare_to_baseline(&baseline, &current, 2.0);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].kind, "infrastructure");
+        assert!(
+            failures[0].detail.contains("embedder differs"),
+            "{}",
+            failures[0].detail
+        );
+    }
+
+    /// Two kernel classes, identical numbers: refused, and no metric failure rides along.
+    /// The current side would fail every gate, so a comparison that ran would show it.
+    #[test]
+    fn different_kernel_class_refuses_before_any_metric_is_compared() {
+        let baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+        let mut current = report_with_full(0.1, 0.1, 0.1, 0.1);
+        current.kernel = KernelClass {
+            class: "x86_64-avx512f".to_string(),
+            cpu_model: "INTEL(R) XEON(R) PLATINUM 8573C".to_string(),
+            features: vec!["avx512f".into()],
+        };
+        let failures = compare_to_baseline(&baseline, &current, 2.0);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].kind, "infrastructure");
+        let detail = &failures[0].detail;
+        assert!(detail.contains("kernel class differs"), "{detail}");
+        assert!(detail.contains("x86_64-avx2-fma"), "{detail}");
+        assert!(detail.contains("PLATINUM 8573C"), "{detail}");
+    }
+
+    const TAPE_A: &str = "aaaaaaaaaaaa1111111111111111111111111111111111111111111111111111";
+    const TAPE_B: &str = "bbbbbbbbbbbb2222222222222222222222222222222222222222222222222222";
+
+    /// Two runs that replayed one tape saw identical model outputs, so the CPU does not
+    /// matter: a different kernel class is compared, and a real drop is a regression.
+    #[test]
+    fn same_tape_on_different_kernel_classes_is_compared() {
+        let mut baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+        let mut current = report_with_full(0.57, 0.7, 0.5, 0.4);
+        baseline.model_tape = Some(TAPE_A.to_string());
+        current.model_tape = Some(TAPE_A.to_string());
+        current.kernel = KernelClass {
+            class: "x86_64-avx512f+avx512bw+avx512dq+avx512vl+avx512vnni".to_string(),
+            cpu_model: "Intel(R) Xeon(R) Platinum 8370C".to_string(),
+            features: vec!["avx512f".into()],
+        };
+        let failures = compare_to_baseline(&baseline, &current, 2.0);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].kind, "regression");
+    }
+
+    /// Different tapes, or one live run and one replayed run, are two sets of model
+    /// outputs. Refused before any metric, in either order.
+    #[test]
+    fn different_model_outputs_are_refused_in_either_order() {
+        for (b, c) in [
+            (Some(TAPE_A), Some(TAPE_B)),
+            (Some(TAPE_A), None),
+            (None, Some(TAPE_A)),
+        ] {
+            let mut baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+            let mut current = report_with_full(0.1, 0.1, 0.1, 0.1);
+            baseline.model_tape = b.map(str::to_string);
+            current.model_tape = c.map(str::to_string);
+            let failures = compare_to_baseline(&baseline, &current, 2.0);
+            assert_eq!(failures.len(), 1, "{b:?} vs {c:?}: {failures:?}");
+            assert_eq!(failures[0].kind, "infrastructure");
+            assert!(
+                failures[0].detail.contains("model outputs differ"),
+                "{}",
+                failures[0].detail
+            );
+        }
+    }
+
+    /// Reports written before the field existed ran their models live.
+    #[test]
+    fn report_without_model_tape_key_parses_as_live() {
+        let mut v = serde_json::to_value(report_with_full(0.6, 0.7, 0.5, 0.4)).unwrap();
+        v.as_object_mut().unwrap().remove("model_tape");
+        let parsed: Report = serde_json::from_value(v).expect("old report must parse");
+        assert_eq!(parsed.model_tape, None);
+    }
+
+    /// Same class on different chips is comparable: the class, not the chip, decides the
+    /// kernels. On the CI fleet an EPYC 7763 and an EPYC 9V74 with AVX-512 hidden gave
+    /// byte-identical results.
+    #[test]
+    fn same_kernel_class_on_a_different_chip_is_compared() {
+        let baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+        let mut current = report_with_full(0.57, 0.7, 0.5, 0.4);
+        current.kernel.cpu_model = "AMD EPYC 9V74 80-Core Processor".to_string();
+        let failures = compare_to_baseline(&baseline, &current, 2.0);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].kind, "regression");
+    }
+
+    /// A report that predates the field parses with an empty class and is refused on either
+    /// side. This is the path the first run after this change takes against an old baseline.
+    #[test]
+    fn unrecorded_kernel_class_is_refused_on_either_side() {
+        for (b, c) in [("", "x86_64-avx2-fma"), ("x86_64-avx2-fma", ""), ("", "")] {
+            let mut baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+            let mut current = report_with_full(0.6, 0.7, 0.5, 0.4);
+            baseline.kernel.class = b.to_string();
+            current.kernel.class = c.to_string();
+            let failures = compare_to_baseline(&baseline, &current, 2.0);
+            assert_eq!(failures.len(), 1, "{b:?} vs {c:?}: {failures:?}");
+            assert_eq!(failures[0].kind, "infrastructure");
+            assert!(
+                failures[0]
+                    .detail
+                    .contains("does not record the CPU kernel class"),
+                "{}",
+                failures[0].detail
+            );
+        }
+    }
+
+    /// The baseline checked in before this field existed has no `kernel` key. It must still
+    /// parse, with an empty class, rather than fail deserialisation.
+    #[test]
+    fn report_without_kernel_key_parses_with_empty_class() {
+        let mut v = serde_json::to_value(report_with_full(0.6, 0.7, 0.5, 0.4)).unwrap();
+        v.as_object_mut().unwrap().remove("kernel");
+        let parsed: Report = serde_json::from_value(v).expect("old report must parse");
+        assert_eq!(parsed.kernel, KernelClass::default());
+    }
+
+    /// The feature sets the CI fleet actually exposed (run 35900250723's cpu.txt and the
+    /// gate reports), with `is_x86_feature_detected!` spellings.
+    const EPYC_7763: &[&str] = &["avx", "avx2", "fma"];
+    /// An EPYC 9V74 whose hypervisor hid AVX-512: it exposes what a 7763 does.
+    const EPYC_9V74_MASKED: &[&str] = &["avx", "avx2", "fma"];
+    const XEON_8573C: &[&str] = &[
+        "avx",
+        "avx2",
+        "fma",
+        "avx512f",
+        "avx512bw",
+        "avx512dq",
+        "avx512vl",
+        "avx512vnni",
+    ];
+    const XEON_6973P_C: &[&str] = &[
+        "avx",
+        "avx2",
+        "fma",
+        "avx512f",
+        "avx512bw",
+        "avx512dq",
+        "avx512vl",
+        "avx512vnni",
+        "avx512bf16",
+        "avx512fp16",
+        "avxvnni",
+        "amx-tile",
+        "amx-int8",
+        "amx-bf16",
+    ];
+
+    /// The split the gate measured: the 8573C and the 6973P-C gave different results on 6
+    /// cases, so they must not share a class, even though both are AVX-512 with VNNI.
+    #[test]
+    fn xeon_8573c_and_6973p_c_are_different_classes() {
+        let a = class_from_features(XEON_8573C);
+        let b = class_from_features(XEON_6973P_C);
+        assert_ne!(a, b);
+        assert_eq!(a, "x86_64-avx512f+avx512bw+avx512dq+avx512vl+avx512vnni");
+        assert!(b.ends_with("+amx-tile+amx-int8+amx-bf16"), "{b}");
+    }
+
+    /// The machines that gave byte-identical results share a class, and that class is the
+    /// exact string the checked-in baseline records.
+    #[test]
+    fn avx2_machines_keep_the_baseline_class() {
+        assert_eq!(class_from_features(EPYC_7763), "x86_64-avx2-fma");
+        assert_eq!(class_from_features(EPYC_9V74_MASKED), "x86_64-avx2-fma");
+    }
+
+    /// Feature order in the input does not change the name: it follows
+    /// `KERNEL_CLASS_EXTRAS`, so two runners that probe in a different order still agree.
+    #[test]
+    fn class_name_is_independent_of_feature_order() {
+        let mut reversed: Vec<&str> = XEON_6973P_C.to_vec();
+        reversed.reverse();
+        assert_eq!(
+            class_from_features(&reversed),
+            class_from_features(XEON_6973P_C)
+        );
+    }
+
+    /// On this machine, the class detection reports is the one its own features name.
+    #[test]
+    fn detected_class_is_named_by_its_features() {
+        let k = KernelClass::detect();
+        assert!(!k.class.is_empty());
+        if cfg!(target_arch = "x86_64") {
+            let names: Vec<&str> = k.features.iter().map(String::as_str).collect();
+            assert_eq!(k.class, class_from_features(&names), "{k:?}");
+        }
+    }
+
+    /// A `ce_rerank=0` dispatch against the reranked baseline is two pipelines, not a
+    /// regression. The current side would fail every gate, so a comparison that ran would show.
+    #[test]
+    fn different_rerank_setting_refuses_before_any_metric_is_compared() {
+        let baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+        let mut current = report_with_full(0.1, 0.1, 0.1, 0.1);
+        current.rerank = Some(RerankSetting {
+            enabled: false,
+            depth: 30,
+        });
+        let failures = compare_to_baseline(&baseline, &current, 2.0);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].kind, "infrastructure");
+        let detail = &failures[0].detail;
+        assert!(detail.contains("reranker setting differs"), "{detail}");
+        assert!(detail.contains("cross-encoder on, depth 30"), "{detail}");
+        assert!(detail.contains("cross-encoder off"), "{detail}");
+    }
+
+    /// Depth decides which candidates the reranker sees, so two depths are refused too.
+    #[test]
+    fn different_rerank_depth_refuses_when_both_rerank() {
+        let baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+        let mut current = report_with_full(0.6, 0.7, 0.5, 0.4);
+        current.rerank = Some(RerankSetting {
+            enabled: true,
+            depth: 100,
+        });
+        let failures = compare_to_baseline(&baseline, &current, 2.0);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].kind, "infrastructure");
+        assert!(
+            failures[0].detail.contains("depth 100"),
+            "{}",
+            failures[0].detail
+        );
+    }
+
+    /// Without reranking, `SHODH_CE_DEPTH` is never read, so a differing depth is not a
+    /// different pipeline and the comparison runs.
+    #[test]
+    fn rerank_depth_is_ignored_when_neither_side_reranks() {
+        let mut baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+        let mut current = report_with_full(0.57, 0.7, 0.5, 0.4);
+        baseline.rerank = Some(RerankSetting {
+            enabled: false,
+            depth: 30,
+        });
+        current.rerank = Some(RerankSetting {
+            enabled: false,
+            depth: 100,
+        });
+        let failures = compare_to_baseline(&baseline, &current, 2.0);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].kind, "regression");
+    }
+
+    /// Not recorded is refused on either side: it is not the same as off.
+    #[test]
+    fn unrecorded_rerank_setting_is_refused_on_either_side() {
+        let set = Some(RerankSetting {
+            enabled: true,
+            depth: 30,
+        });
+        for (b, c) in [(None, set), (set, None), (None, None)] {
+            let mut baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+            let mut current = report_with_full(0.6, 0.7, 0.5, 0.4);
+            baseline.rerank = b;
+            current.rerank = c;
+            let failures = compare_to_baseline(&baseline, &current, 2.0);
+            assert_eq!(failures.len(), 1, "{b:?} vs {c:?}: {failures:?}");
+            assert_eq!(failures[0].kind, "infrastructure");
+            assert!(
+                failures[0]
+                    .detail
+                    .contains("does not record whether it reranked"),
+                "{}",
+                failures[0].detail
+            );
+        }
+    }
+
+    /// The baseline checked in before this field existed has no `rerank` key. It must
+    /// parse, as not recorded.
+    #[test]
+    fn report_without_rerank_key_parses_as_unrecorded() {
+        let mut v = serde_json::to_value(report_with_full(0.6, 0.7, 0.5, 0.4)).unwrap();
+        v.as_object_mut().unwrap().remove("rerank");
+        let parsed: Report = serde_json::from_value(v).expect("old report must parse");
+        assert_eq!(parsed.rerank, None);
+    }
+
+    /// A report of unknown provenance is refused on either side, even against another unknown.
+    /// The asymmetric empty cases pin the `is_empty` branch apart from the differs branch: an
+    /// empty embedder against a real one is refused as unknown, not as a mismatch.
+    #[test]
+    fn unknown_embedder_is_refused_on_either_side() {
+        for (b, c) in [
+            (EMBEDDER_UNKNOWN, "minilm-l6-v2"),
+            ("minilm-l6-v2", EMBEDDER_UNKNOWN),
+            (EMBEDDER_UNKNOWN, EMBEDDER_UNKNOWN),
+            ("", "minilm-l6-v2"),
+            ("minilm-l6-v2", ""),
+            ("", ""),
+        ] {
+            let mut baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+            let mut current = report_with_full(0.6, 0.7, 0.5, 0.4);
+            baseline.embedder = b.to_string();
+            current.embedder = c.to_string();
+            let failures = compare_to_baseline(&baseline, &current, 2.0);
+            assert_eq!(failures.len(), 1, "{b:?} vs {c:?}: {failures:?}");
+            assert_eq!(failures[0].kind, "infrastructure");
+            assert!(
+                failures[0].detail.contains("provenance"),
+                "{}",
+                failures[0].detail
+            );
+        }
+    }
+
     #[test]
     fn missing_baseline_full_layer_emits_infra_failure() {
         let mut baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
@@ -839,6 +1769,7 @@ mod tests {
         CategoryReport {
             ndcg_at_10: recall,
             recall_at_10: recall,
+            hit_at_10: recall,
             precision_at_10: recall,
             mrr: recall,
             p_at_1: p1,

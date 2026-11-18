@@ -12,6 +12,117 @@ the `recall-eval` binary (see `src/bin/recall_eval.rs`).
   measured against this; regressions beyond the configured tolerance fail CI
   (see issue #267 / RH-5).
 
+## The PR gate baseline (`locomo-gate`)
+
+CI's L1 Smoke Suite (`.github/workflows/recall.yml`) runs the 100-case
+`locomo-gate` suite and compares against two checked-in files:
+
+- `locomo-gate-baseline.json`: aggregate metrics. The `recall-eval` binary
+  gates on these; its exit code is the pass/fail.
+- `locomo-gate-baseline.per-case.json`: the per-case records from the same run.
+  `scripts/recall_diff.py` uses them to list, in the PR comment, every case
+  whose result moved, bucketed into lost gold / gained gold / p@1 flips /
+  rank-only.
+
+On this suite the 2% tolerance is below one case for p@1 (n=100, one case =
+0.01), so for that metric the gate is a no-net-loss check. Within one CPU
+kernel class the runs are deterministic: five repeats must be byte-identical,
+and identical code gives identical per-case results on every runner of that
+class. So within a class, any case that moves is a real change, not noise. The
+case list is how a reviewer decides whether a change is worth what it moved.
+
+**Across kernel classes, identical code does not give identical results.**
+ONNX Runtime picks its kernels by CPUID, and no setting pins the choice.
+GitHub's `ubuntu-latest` pool mixes CPUs that expose different features. On one
+tree, the gate gave three distinct results:
+
+| Runner | Exposes | vs the AVX2 result |
+| ------ | ------- | ------------------ |
+| AMD EPYC 7763 (most runners) | AVX2, FMA | — |
+| Xeon Platinum 8573C | + AVX-512 with VNNI | 1 case (q30) |
+| Xeon 6973P-C | + AVX-512 with VNNI, AMX, FP16, BF16, AVX-VNNI | 7 cases |
+
+Where AVX-512 is exposed, the embedder drifts by up to 1.5e-8, GLiNER by up to
+8 ULP, and the cross-encoder by up to 0.06 in logit (runs 35901281838 and
+35902501577). A hypervisor can hide AVX-512 from a chip that has it: an EPYC
+9V74 with AVX-512 masked gave the 7763's results byte for byte. So the class is
+what the runner *exposes*.
+
+The class therefore names every dispatch-relevant feature the runner exposes,
+for example `x86_64-avx2-fma` or
+`x86_64-avx512f+avx512bw+avx512dq+avx512vl+avx512vnni`. Which of the
+6973P-C's extra features makes the difference was not isolated, so two machines
+share a class only if they expose the same set. A split that is too fine costs a
+re-run. A split that is too coarse reports runner differences as regressions.
+The first version of this check (#566) used AVX-512 alone as the key, and it
+put the 8573C and the 6973P-C in one class. The 6973P-C's 7-case result, first
+seen in run 35894635781, was reproduced exactly by run 35982981356 on a 6973P-C.
+Model fingerprints on 32 texts had shown the two CPUs agreeing, which was too
+small a sample to separate them.
+
+Each report records the class as `kernel.class`, with the CPU model and
+features alongside. `recall-eval` refuses to compare two classes as
+`infrastructure`. The workflow fails a PR run on the wrong class within seconds
+(re-run the job: GitHub assigns runner hardware per job), and it checks that its
+own derivation of the class agrees with `recall-eval`'s. If a same-class
+comparison ever moves cases on unchanged code, compare the recorded
+`cpu_model` and `features` first.
+
+### Replayed model outputs (`tests/recall/model-tape.json`)
+
+The gate replays a **model tape**: every output the embedder, GLiNER and the
+cross-encoder gave in one recorded run, keyed by the exact input
+(`src/embeddings/model_tape.rs`). A replayed run does no model arithmetic, so it
+gives the same result on every CPU. Two replays on different kernel classes
+matched each other and the live recording on 100/100 cases (#570). A replay is
+also about 15x faster per query.
+
+- `tests/recall/model-tape.json` pins the tape: `{"tag", "asset", "sha256"}`,
+  a GitHub release asset. PR runs and dispatches (`model_tape=pinned`) download
+  it, check the sha256, and replay it. With no pin file, the models run live.
+- Every report records the tape it replayed as `model_tape` (its sha256).
+  `recall-eval` refuses to compare a live run with a replayed one, or two
+  different tapes. Two runs of one tape are compared on any CPU, and the CPU
+  class check is skipped for them.
+- **A change to what a model is fed needs a new tape.** A new prefix, a different
+  entity set, or a new sentence for the relation typer all ask the models for
+  inputs the tape does not hold. Each one is a replay miss, and a miss fails the
+  run as `infrastructure`; it is never silently computed live. Then:
+  1. `gh workflow run recall.yml --ref <branch> -f model_tape=record` records a
+     new tape (the harness also scores every query x corpus reranker pair, so
+     changes to the candidate pool are covered). Check the run reports no tape
+     problems and that repeats 2-5 added no entries.
+  2. Publish `model-tape.jsonl.gz` as a release asset under a new tag, and
+     update the pin file with that tag and its sha256.
+  3. Regenerate the baseline with `model_tape=pinned`, as below. The baseline
+     and the pin must name the same tape.
+- A model or ONNX Runtime upgrade also needs a new tape. The tape records the
+  sha256 of each model's files and refuses to replay against different ones.
+
+**Regenerate both files together, from the same run, on `main`, after a merged
+change that intentionally moved quality.** A stale baseline hides regressions:
+while main sat 3.5pp of recall@10 above the baseline, a PR could lose up to
+that much and still pass.
+
+1. `gh workflow run recall.yml --ref main` (defaults: `locomo-gate`, `full`,
+   5 repeats, `ce_rerank=1`). The gate measures the pipeline the server
+   ships, which reranks with the cross-encoder by default, so the baseline is
+   recorded with it on. `-f ce_rerank=0` measures the library default for
+   comparison and must not be committed as the baseline. Each report records
+   the setting as `rerank` (`enabled`, `depth`), and `recall-eval` refuses to
+   compare two settings as `infrastructure`, so such a run cannot pass or
+   fail the gate by accident.
+2. `gh run download <run-id> -n recall-eval-report`.
+3. Copy `current.json` to `locomo-gate-baseline.json` and `per-case.json` to
+   `locomo-gate-baseline.per-case.json`. Check that `git_sha` names the main
+   commit you meant, that `repeats` is 5, that `rerank` is
+   `{"enabled": true, "depth": 30}`, and that `kernel.class` is
+   `x86_64-avx2-fma`. That is the most common class in the pool, so it is
+   the one PR runs land on most often. If the run landed on another class,
+   dispatch again.
+4. Add a row to the regeneration history below, and in the PR list the cases
+   that moved since the previous baseline.
+
 ## Regenerating the baseline
 
 Only regenerate `baseline.json` when you have *intentionally* changed retrieval
@@ -51,6 +162,39 @@ git diff tests/recall/baseline.json
 If a metric moved by more than ~2% in either direction, write a one-paragraph
 justification in the PR description so future bisects have context.
 
+## Stage fingerprints (`SHODH_STAGE_EXPORT`)
+
+`SHODH_STAGE_EXPORT=<path.jsonl>` makes `recall-eval` write every stage of the
+`full` pipeline as JSON lines:
+- `ingest`: one record per corpus item, with a hash of its stored embedding
+  bytes and its NER spans.
+- `graph`: one record for the graph's node and edge sets, keyed by entity name
+  because uuids are minted per process.
+- `case`: one record per case, with each retrieval leg, the fused ranking, the
+  reranker's pool and its scores, and the final ranking.
+
+Scores are written as f32 bit patterns, so a one-ULP move shows up as a move.
+The file is overwritten on each repeat; the repeat gate requires the repeats
+to agree, so the last one stands for the run.
+
+The repeat check compares stages within one process. The export lets you
+compare two processes, from two machines, two commits or two settings:
+
+```bash
+python scripts/stage_diff.py a.jsonl b.jsonl
+```
+
+For each stage it reports whether the order changed or only the scores did.
+Comparing an AVX2 runner with an AVX-512 one located the cross-runner
+divergence (#566):
+- 330 of 629 embeddings and 469 NER score sets differ.
+- 0 NER span sets and 0 graph nodes or edges differ.
+- Leg order differs on 33 to 100 cases; the reranker's pool differs on 14.
+
+The per-case records are also the training data for anything that learns from
+the reranker's scores over its pool. Collect them on one CPU kernel class: the
+scores differ across classes.
+
 ## Per-pipeline-layer attribution (`--layer`)
 
 `recall-eval` accepts a `--layer` flag (RH-8, #270) that selects which
@@ -86,11 +230,11 @@ share more than `full`.
 ### Caveats — read these before staring at the numbers
 
 1. **`+rerank` is a misnomer in this codebase.** Issue #270 specs the mode
-   as a cross-encoder rerank stage. shodh has no cross-encoder. The gate
-   wraps the **ontological re-ranker** at Layer 4.9 (multiplicative boost
-   when episode entity types match the query's expected ontology labels).
-   The label is preserved for spec fidelity; if a cross-encoder ever
-   lands, it joins this same gate.
+   as a cross-encoder rerank stage, but it wraps the **ontological
+   re-ranker** at Layer 4.9 (multiplicative boost when episode entity types
+   match the query's expected ontology labels). The cross-encoder that
+   landed in #536 is a separate stage behind `SHODH_CE_RERANK`, off by
+   default, and is not part of any `--layer` mode.
 
 2. **Modes below `full` skip Layer 5 unified scoring.** Per-layer ndcg
    numbers will look strictly *lower* than `full` for reasons that are
@@ -118,3 +262,8 @@ share more than `full`.
 | Date       | SHA       | Embedder       | Notes                          |
 | ---------- | --------- | -------------- | ------------------------------ |
 | 2026-05-03 | `6756665` | minilm-l6-v2   | Initial capture (RH-6, #268).  |
+| 2026-08-08 | `ec7abd2` | minilm-l6-v2   | `locomo-gate` aggregate baseline, 1 repeat, no per-case file. |
+| 2026-09-22 | `cef6721` | minilm-l6-v2   | `locomo-gate` + per-case, 5 repeats (workflow run 35693977402). After #509 (keyphrases stop becoming graph nodes; q62 lost, q46/q52 gained) and #560 (BM25 stemming; q62, q129, q85 gained, 18 rank-only moves, none lost). recall@10 0.5268 → 0.5618, ndcg@10 0.4111 → 0.4248, p@1 0.31 → 0.31. |
+| 2026-09-24 | `628cbeb` | minilm-l6-v2   | `locomo-gate` + per-case, 5 repeats, cross-encoder on, **kernel class `x86_64-avx2-fma`** (AMD EPYC 7763, workflow run 35956028151). First baseline recorded with the reranker on and the first to record its CPU kernel class. Measured on the PR branch that adds the class field, because a baseline without the field is refused, so it could not come from main first. Per-case results are identical to main `681b2d8` on an AVX2 runner (run 35891724716, 0 of 100 differ). `failures` was cleared by hand: it held that run's refusal of the previous class-less baseline. 43 cases moved vs `cef6721`: 14 gained gold, 3 lost gold (q125, q30, q43), p@1 +13/−1 (q62), 12 rank-only. recall@10 0.5618 → 0.6368, ndcg@10 0.4248 → 0.5409, mrr 0.4042 → 0.5372, p@1 0.31 → 0.46. Latency p50 535 ms. AVX2 runners are the slow class: the same tree ran at 216–240 ms p50 on AVX-512 runners. |
+| 2026-09-24 | `16b8bd5` | minilm-l6-v2   | `locomo-gate` + per-case, 5 repeats, cross-encoder on (depth 30), kernel class `x86_64-avx2-fma` (AMD EPYC 7763, workflow run 35982968874). Re-recorded so the report carries its `rerank` setting. It was measured on the branch that adds the field, because a baseline without it is refused. Per-case results are identical to the previous baseline (0 of 100 differ), and metrics are unchanged. `failures` was cleared by hand: it held that run's refusal of the previous baseline. |
+| 2026-09-27 | `988808f` | minilm-l6-v2   | `locomo-gate` + per-case, 5 repeats, cross-encoder on (depth 30), kernel class `x86_64-avx2-fma` (AMD EPYC 7763, PR #573 gate run 36301554039). #573 admits every NER span GLiNER commits (the graph floor was 0.6, set for BERT-tiny). 13 cases moved: q27 and q23 gained gold, q85 (open_domain, n=10) lost it, 10 rank-only. ndcg@10 0.5409 → 0.5524, mrr 0.5372 → 0.5524, p@1 0.46 → 0.47, recall@10 0.6368 → 0.6388. Recorded from the PR run because the one-case open_domain drop exceeds that category's tolerance; the change was judged on the held-out n=1531 set instead (same class: p@1 0.5036 → 0.5042, recall@10 0.6380 → 0.6386). `failures` cleared by hand; it held that run's open_domain regression against the previous baseline. |

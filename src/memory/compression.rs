@@ -215,19 +215,25 @@ impl CompressionPipeline {
             .unwrap_or("unknown");
 
         match strategy {
-            // Both LZ4 and hybrid store the full experience in the LZ4 blob.
-            "lz4" | "hybrid" => self.decompress_lz4(memory),
+            // Both LZ4 and hybrid store the full experience in the LZ4 blob — but
+            // the outer label is not evidence of what the blob holds. The pre-fix
+            // `compress_hybrid` ran the lossy semantic pass and then
+            // `compress_lz4`, which stamped "lz4" last, so a hybrid record from
+            // that era advertises the lossless strategy over a blob whose inner
+            // experience is the truncated one. Decode first, judge the inside.
+            "lz4" | "hybrid" => {
+                let inner = self.decode_lz4_blob(memory)?;
+                if Self::is_legacy_shape(&inner.metadata, &inner.content) {
+                    return Err(Self::legacy_lossy_error(memory));
+                }
+                Ok(Self::restore_from_blob(memory, inner))
+            }
             "semantic" => {
                 // Legacy pre-fix records truncated the body at storage time and
                 // are unrecoverable. Fail honestly rather than returning a
                 // truncated summary as if it were the original content.
-                if Self::is_legacy_lossy(memory) {
-                    return Err(anyhow!(
-                        "Memory '{}' was written by the pre-fix lossy semantic compressor: \
-                         its full content was truncated at storage time and cannot be \
-                         recovered. Only the surviving summary/keywords remain in place.",
-                        memory.id.0
-                    ));
+                if Self::is_legacy_shape(&memory.experience.metadata, &memory.experience.content) {
+                    return Err(Self::legacy_lossy_error(memory));
                 }
                 // New-format semantic records preserve the full body — restore
                 // the uncompressed state in place.
@@ -244,23 +250,54 @@ impl CompressionPipeline {
         }
     }
 
-    /// Detect legacy pre-fix records whose content was destructively truncated.
+    /// The shape the pre-fix semantic compressor left behind: it overwrote
+    /// `experience.content` with a truncated summary ending in `...`, wrote
+    /// `keywords`, and never wrote a `summary` key. New-format compression always
+    /// writes `summary` while preserving the full body.
     ///
-    /// The pre-fix semantic compressor overwrote `experience.content` with a
-    /// truncated summary ending in `...` and never wrote a `summary` metadata
-    /// key. New-format compression always writes `summary` while preserving the
-    /// full body, so a `semantic` record missing that key with a `...`-terminated
-    /// body is an unrecoverable legacy record.
-    fn is_legacy_lossy(memory: &Memory) -> bool {
-        let strategy = memory
-            .experience
-            .metadata
-            .get("compression_strategy")
-            .map(|s| s.as_str())
-            .unwrap_or("");
-        strategy == "semantic"
-            && !memory.experience.metadata.contains_key("summary")
-            && memory.experience.content.trim_end().ends_with("...")
+    /// Judged on an experience's OWN `compression_strategy`, which is why it takes
+    /// the metadata and content rather than a `Memory`: for an LZ4-wrapped record
+    /// the experience to judge is the one inside the blob, not the outer one. The
+    /// outer `keywords` key cannot stand in for the label — callers set `keywords`
+    /// themselves on every ingest path, so an intact LZ4 record can carry it too.
+    fn is_legacy_shape(meta: &std::collections::HashMap<String, String>, content: &str) -> bool {
+        meta.get("compression_strategy").map(|s| s.as_str()) == Some("semantic")
+            && !meta.contains_key("summary")
+            && content.trim_end().ends_with("...")
+    }
+
+    /// Detect legacy pre-fix records whose content was destructively truncated,
+    /// under whatever label the outer record carries.
+    ///
+    /// A `semantic` record is judged directly. An `lz4` or `hybrid` record is
+    /// judged by the experience inside its blob: the pre-fix `compress_hybrid`
+    /// LZ4-encoded the lossy semantic pass's output, so the inner metadata still
+    /// says `semantic` with no `summary` while the outer label says `lz4`. A blob
+    /// that does not decode is not a legacy record; `decompress` reports that
+    /// failure on its own terms.
+    fn is_legacy_lossy(&self, memory: &Memory) -> bool {
+        if !memory.compressed {
+            return false;
+        }
+        match self.get_strategy(memory) {
+            Some("semantic") => {
+                Self::is_legacy_shape(&memory.experience.metadata, &memory.experience.content)
+            }
+            Some("lz4") | Some("hybrid") => self
+                .decode_lz4_blob(memory)
+                .map(|inner| Self::is_legacy_shape(&inner.metadata, &inner.content))
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+
+    fn legacy_lossy_error(memory: &Memory) -> anyhow::Error {
+        anyhow!(
+            "Memory '{}' was written by the pre-fix lossy semantic compressor: \
+             its full content was truncated at storage time and cannot be \
+             recovered. Only the surviving summary/keywords remain in place.",
+            memory.id.0
+        )
     }
 
     /// Check if a memory's compression is lossless (can be fully restored).
@@ -271,7 +308,7 @@ impl CompressionPipeline {
         if !memory.compressed {
             return true;
         }
-        if Self::is_legacy_lossy(memory) {
+        if self.is_legacy_lossy(memory) {
             return false;
         }
         let strategy = memory
@@ -295,8 +332,11 @@ impl CompressionPipeline {
             .map(|s| s.as_str())
     }
 
-    /// Decompress LZ4 compressed memory
-    fn decompress_lz4(&self, memory: &Memory) -> Result<Memory> {
+    /// Decode the standalone `Experience` an `lz4`/`hybrid` record carries in
+    /// `compressed_data`, with the zip-bomb guards. Returns it as written at
+    /// compression time — including its own `compression_strategy`, which is
+    /// the evidence `is_legacy_lossy` needs and `restore_from_blob` strips.
+    fn decode_lz4_blob(&self, memory: &Memory) -> Result<Experience> {
         if let Some(compressed_b64) = memory.experience.metadata.get("compressed_data") {
             let compressed = general_purpose::STANDARD.decode(compressed_b64)?;
 
@@ -340,8 +380,36 @@ impl CompressionPipeline {
                 ));
             }
 
-            let mut experience: Experience = crate::serialization::decode_raw(&decompressed)?;
+            // The blob is a standalone postcard `Experience`, written at
+            // compression time — so it carries whatever `NerEntityRecord`
+            // layout was current then. A blob written before `fine_label`
+            // existed (2026-07-12) desynchronises today's decoder by one byte
+            // per NER record, exactly as an uncompressed record does, and on a
+            // store where nearly every memory is compressed this is the
+            // majority path rather than an edge case. Same recovery as
+            // `deserialize_memory`: current layout first, older layout only on
+            // failure, and the current-layout error is the one reported.
+            let experience: Experience =
+                match crate::serialization::decode_raw::<Experience>(&decompressed) {
+                    Ok(experience) => experience,
+                    Err(current_err) => {
+                        let _generation =
+                            crate::memory::types::NerWireGeneration::PreFineLabel.enter();
+                        crate::serialization::decode_raw::<Experience>(&decompressed)
+                            .map_err(|_| current_err)?
+                    }
+                };
 
+            Ok(experience)
+        } else {
+            Err(anyhow!("No compressed data found"))
+        }
+    }
+
+    /// Restore a memory from its decoded blob: carry across the fields the blob
+    /// cannot hold, then clear the compression markers.
+    fn restore_from_blob(memory: &Memory, mut experience: Experience) -> Memory {
+        {
             // `Experience::toponyms` is `#[serde(skip)]` — it rides at the tail
             // of `MemoryFlat` rather than inside the `Experience` encoding, so
             // it is NOT in this blob. The compressed memory kept it on its outer
@@ -350,6 +418,19 @@ impl CompressionPipeline {
             // drop resolved places and LZ4 compression would stop being
             // lossless, contrary to `is_lossless`.
             experience.toponyms = memory.experience.toponyms.clone();
+            // `Experience::declared_entities` is `#[serde(skip)]` for the same
+            // reason and is likewise absent from the blob. Without this line
+            // decompression would silently retract every caller assertion the
+            // memory carried, and the graph would stop being able to tell a
+            // name the user declared from a keyphrase an extractor guessed —
+            // for compressed memories only, which is the majority of an aged
+            // store.
+            experience.declared_entities = memory.experience.declared_entities.clone();
+            // `Experience::origin` is `#[serde(skip)]` for the same reason and
+            // is likewise absent from the blob. Without this line every
+            // compressed memory would decompress as `Unknown` — a silent
+            // provenance wipe that looks exactly like an old record.
+            experience.origin = memory.experience.origin;
 
             // Restore the memory
             let mut restored = memory.clone();
@@ -359,9 +440,7 @@ impl CompressionPipeline {
             restored.experience.metadata.remove("compression_ratio");
             restored.experience.metadata.remove("compression_strategy");
 
-            Ok(restored)
-        } else {
-            Err(anyhow!("No compressed data found"))
+            restored
         }
     }
 
@@ -1762,6 +1841,64 @@ mod tests {
         )
     }
 
+    /// Every `#[serde(skip)]` field on `Experience` is invisible to the LZ4
+    /// blob, which encodes `experience` STANDALONE. There are three of them now
+    /// — `toponyms`, `declared_entities`, `origin` — and each has to be carried
+    /// across explicitly on decompress or it is silently retracted.
+    ///
+    /// They arrived on separate branches, and `declared_entities` reached this
+    /// file without its carry-across while the other two had one. So this test
+    /// asserts all three together rather than one per field: a fourth skipped
+    /// field added without a carry-across fails HERE, next to the code, instead
+    /// of being noticed only if someone thinks to write a fourth test.
+    #[test]
+    fn lz4_decompression_carries_every_skipped_experience_field() {
+        let pipeline = CompressionPipeline::new();
+
+        let mut memory = create_test_memory(
+            &"Coordination between the Baltimore and London teams".repeat(20),
+            // High importance selects the lossless LZ4 strategy — the one that
+            // encodes `experience` standalone and so loses skipped fields.
+            0.95,
+        );
+        memory.experience.toponyms = vec![Toponym {
+            mention: "Baltimore".to_string(),
+            name: "Baltimore".to_string(),
+            lat: 39.2904,
+            lon: -76.6122,
+            country: "US".to_string(),
+            population: 585_708,
+        }];
+        memory.experience.declared_entities = vec!["Baltimore".to_string()];
+        memory.experience.origin = MemoryOrigin::GithubConnector;
+
+        let compressed = pipeline.compress(&memory).expect("compress");
+        assert_eq!(
+            pipeline.get_strategy(&compressed),
+            Some("lz4"),
+            "precondition: this memory must take the LZ4 path"
+        );
+
+        let restored = pipeline.decompress(&compressed).expect("decompress");
+        assert_eq!(
+            restored.experience.toponyms.len(),
+            1,
+            "decompression dropped the resolved places"
+        );
+        assert_eq!(
+            restored.experience.declared_entities,
+            vec!["Baltimore".to_string()],
+            "decompression retracted the caller's entity assertions — the graph \
+             can no longer tell a declared name from an extracted keyphrase"
+        );
+        assert_eq!(
+            restored.experience.origin,
+            MemoryOrigin::GithubConnector,
+            "decompression wiped the origin"
+        );
+        assert_eq!(restored.experience.content, memory.experience.content);
+    }
+
     #[test]
     fn test_compression_pipeline_default() {
         let pipeline = CompressionPipeline::default();
@@ -1915,6 +2052,90 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("cannot be recovered"));
+    }
+
+    /// What the pre-fix pipeline left on disk under each label: the lossy
+    /// semantic pass's truncated experience (`semantic`, keywords, no summary,
+    /// body ending `...`), and for `lz4`/`hybrid` that same experience
+    /// LZ4-encoded exactly as `compress_lz4` encodes it, with the outer label
+    /// stamped over it.
+    fn legacy_record_under_label(label: &str) -> Memory {
+        let mut legacy = create_test_memory("first few words of the original body ...", 0.1);
+        legacy.compressed = true;
+        legacy
+            .experience
+            .metadata
+            .insert("compression_strategy".to_string(), "semantic".to_string());
+        legacy
+            .experience
+            .metadata
+            .insert("keywords".to_string(), "first,words,original".to_string());
+        if label == "semantic" {
+            return legacy;
+        }
+        let blob = crate::serialization::encode_raw(&legacy.experience).unwrap();
+        let compressed = lz4::block::compress(&blob, None, false).unwrap();
+        legacy.experience.metadata.insert(
+            "compressed_data".to_string(),
+            general_purpose::STANDARD.encode(&compressed),
+        );
+        legacy
+            .experience
+            .metadata
+            .insert("compression_strategy".to_string(), label.to_string());
+        legacy
+    }
+
+    /// The pre-fix `compress_hybrid` stamped "lz4" over the lossy semantic pass,
+    /// so a destroyed record can carry any of the three labels. It is judged by
+    /// the blob's inner experience, not the outer label: with the label-keyed
+    /// check restored, the `lz4` and `hybrid` arms decompress the blob and hand
+    /// back the truncated summary as the body.
+    #[test]
+    fn legacy_truncated_record_is_unrecoverable_under_any_label() {
+        let pipeline = CompressionPipeline::new();
+        for label in ["semantic", "lz4", "hybrid"] {
+            let legacy = legacy_record_under_label(label);
+            assert!(!pipeline.is_lossless(&legacy), "{label}: reported lossless");
+            let err = pipeline
+                .decompress(&legacy)
+                .expect_err(&format!("{label}: decompressed a destroyed record"));
+            assert!(
+                err.to_string().contains("cannot be recovered"),
+                "{label}: {err}"
+            );
+        }
+    }
+
+    /// `keywords` is caller-supplied metadata on every ingest path, so its
+    /// presence says nothing about which pipeline wrote the record. An intact
+    /// LZ4 record whose caller set `keywords` and whose body happens to end in
+    /// `...` must round-trip; a shape check on the outer metadata refused it
+    /// while the full body sat in the blob.
+    #[test]
+    fn intact_lz4_record_with_caller_keywords_round_trips() {
+        let pipeline = CompressionPipeline::new();
+        let body = format!("{} to be continued...", make_body(120));
+        let mut memory = create_test_memory(&body, 0.9);
+        memory
+            .experience
+            .metadata
+            .insert("keywords".to_string(), "caller,supplied".to_string());
+
+        let compressed = pipeline.compress_lz4(&memory).unwrap();
+        assert!(pipeline.is_lossless(&compressed));
+        let restored = pipeline
+            .decompress(&compressed)
+            .expect("intact lz4 record refused as legacy");
+        assert_eq!(restored.experience.content, body);
+        assert_eq!(
+            restored
+                .experience
+                .metadata
+                .get("keywords")
+                .map(String::as_str),
+            Some("caller,supplied")
+        );
     }
 
     #[test]

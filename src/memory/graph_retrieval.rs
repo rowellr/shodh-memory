@@ -50,7 +50,7 @@ use crate::constants::{
 use crate::embeddings::Embedder;
 use crate::graph_memory::{EdgeTier, EntityLabel, EpisodicNode, GraphMemory, RelationType};
 use crate::memory::query_parser::{infer_ontological_intent, OntologicalIntent};
-use crate::memory::recall_readonly;
+use crate::memory::recall_is_readonly;
 use crate::memory::types::MemoryTier;
 // Note: compute_relevance removed - using unified density-weighted scoring directly
 use crate::memory::query_parser::{analyze_query, QueryAnalysis};
@@ -254,6 +254,7 @@ fn spread_single_direction(
     threshold: f32,
     ontological_intent: Option<&OntologicalIntent>,
     entity_label_cache: &mut HashMap<Uuid, Option<Vec<EntityLabel>>>,
+    limits: TraversalLimits,
 ) -> Result<(HashMap<Uuid, f32>, Vec<Uuid>)> {
     let mut activation_map: HashMap<Uuid, f32> = seeds.iter().cloned().collect();
     let mut traversed_edges: Vec<Uuid> = Vec::new();
@@ -275,7 +276,7 @@ fn spread_single_direction(
     // RELATIVE to sibling edges, so a weak edge competing with strong ones can be
     // starved harder than a floor would ever allow. A floored `ppr_edge_weight` has
     // never been tested. See the follow-up issue before re-deriving this from scratch.
-    let dir_fix = edge_dir_fix_enabled();
+    let dir_fix = limits.dir_fix;
 
     // Lever-1 prototype: weight each hop by the edge's relation type so activation
     // flows along meaningful predicates (causal/structural) rather than mere
@@ -290,18 +291,38 @@ fn spread_single_direction(
         // HashMap iteration order produces slightly different sums and flips
         // near-tie ranks between repeats (the query-time residual after the
         // ingest-order fixes). Sorting by Uuid pins the accumulation order.
-        let mut current_activated: Vec<(Uuid, f32)> =
-            activation_map.iter().map(|(id, act)| (*id, *act)).collect();
-        current_activated.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        // Order by entity NAME, not by Uuid.
+        //
+        // Sorting by Uuid pins the accumulation order WITHIN one process and is
+        // a random permutation ACROSS ingests, because entity UUIDs are
+        // re-rolled every time the corpus is ingested. The cross-repeat
+        // determinism guard re-ingests on every repeat, so a Uuid sort here
+        // leaves exactly the ULP wobble it was added to remove — which is the
+        // same conclusion the PPR frontier below already reached and fixed.
+        //
+        // Names are a pure function of graph content, so they are stable across
+        // ingests; uuid stays as the total-order fallback for duplicate names.
+        let mut current_activated: Vec<(String, Uuid, f32)> = activation_map
+            .iter()
+            .map(|(id, act)| {
+                let name = graph
+                    .get_entity(id)
+                    .ok()
+                    .flatten()
+                    .map(|e| e.name)
+                    .unwrap_or_default();
+                (name, *id, *act)
+            })
+            .collect();
+        current_activated.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
-        for (entity_uuid, source_activation) in current_activated {
+        for (_name, entity_uuid, source_activation) in current_activated {
             if source_activation < threshold {
                 continue;
             }
 
-            const MAX_EDGES_PER_SPREAD: usize = 100;
             let edges =
-                graph.get_entity_relationships_limited(&entity_uuid, Some(MAX_EDGES_PER_SPREAD))?;
+                graph.get_entity_relationships_limited(&entity_uuid, Some(limits.max_edges))?;
 
             // Degree normalization: prevent hub nodes from flooding the network.
             // Divides outgoing activation by sqrt(1 + degree), matching the fan effect
@@ -443,6 +464,7 @@ fn bidirectional_spread(
     total_salience: f32,
     hops_per_direction: usize,
     ontological_intent: Option<&OntologicalIntent>,
+    limits: TraversalLimits,
 ) -> Result<(HashMap<Uuid, f32>, Vec<Uuid>, usize)> {
     // Split entities into forward/backward sets (alternating assignment)
     // This distributes entities evenly regardless of count
@@ -484,6 +506,7 @@ fn bidirectional_spread(
         threshold,
         ontological_intent,
         &mut entity_label_cache,
+        limits,
     )?;
 
     let (backward_map, backward_edges) = spread_single_direction(
@@ -493,6 +516,7 @@ fn bidirectional_spread(
         threshold,
         ontological_intent,
         &mut entity_label_cache,
+        limits,
     )?;
 
     // Combine maps with intersection boost
@@ -575,6 +599,19 @@ fn ppr_intern(
 /// `current` is always one endpoint (the edge came from its index), so when it is
 /// the `to`, the neighbour is `from`. With `dir_fix` off, the exact legacy
 /// behaviour is preserved so it can serve as the A/B control.
+///
+/// # How much connectivity the legacy behaviour costs
+///
+/// `add_relationship` stores ONE edge per (pair, relation type) under an
+/// order-independent pair key, and a co-occurrence edge's stored direction is
+/// just NER surface order at ingest (`handlers/state.rs`: `from = entity[i]`,
+/// `to = entity[j]` for `i < j`). Each edge is therefore walkable from exactly
+/// one of its two endpoints: |E| of the 2|E| endpoint incidences are dead, i.e.
+/// HALF the adjacency, and which half is an ingest artefact rather than a
+/// property of the data. The `analyze_graph_reachability` diagnostic that puts
+/// gold within 2 hops for 97.9% of held-out LoCoMo cases walks
+/// `[e.from_entity, e.to_entity]` — undirected — so its ceiling was measured
+/// over a graph the live leg cannot walk.
 /// Diagnostic counter: how many times the direction fix actually changed the
 /// traversal target (the current node was the `to` endpoint, so the true
 /// neighbour is `from`). Zero overhead when the fix is off, because the
@@ -602,14 +639,65 @@ fn edge_neighbor(
     }
 }
 
-/// Read the `SHODH_GRAPH_EDGE_DIR` A/B flag: when set, spreading/PPR/beam traversal
-/// follows edges to their true non-source endpoint instead of the legacy
-/// `to_entity`-only behaviour. Default off until the multi_hop comparison confirms
-/// it before flipping the production default.
-fn edge_dir_fix_enabled() -> bool {
-    std::env::var("SHODH_GRAPH_EDGE_DIR")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+/// Per-node edge budget used by every graph-leg walk when unconfigured.
+///
+/// The LoCoMo graph has 47 entities above degree 50 and a maximum degree of 301
+/// (the ingest-side `hub_max` of 300 binding), so this cap discards up to
+/// two-thirds of a hub's adjacency before traversal ever sees it — and
+/// `get_entity_relationships_limited` truncates by effective strength, so what
+/// is discarded is the WEAK tail, exactly where a PMI-suppressed hub edge to a
+/// rare gold entity lives.
+pub const DEFAULT_GRAPH_MAX_EDGES: usize = 100;
+
+/// Structural traversal budget shared by PPR expansion, reachability injection,
+/// beam traversal and the legacy BFS spread.
+///
+/// # Why this is a struct threaded as a parameter, not an env read per callee
+///
+/// `SHODH_SPREAD_FIX` was a flag whose branch sat BEHIND the default-on
+/// `SHODH_PPR` branch, so it could never execute; its ablation arms silently
+/// duplicated the baseline for months. Reading the environment exactly once, at
+/// the public entry point, and threading the result as a value makes that class
+/// of failure unrepresentable: a callee has no environment to consult, and a
+/// test can construct the non-default value directly instead of mutating
+/// process-global state (which would also race across Rust's multi-threaded
+/// test harness).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TraversalLimits {
+    /// Follow an edge to its true non-source endpoint (`SHODH_GRAPH_EDGE_DIR`).
+    ///
+    /// See [`edge_neighbor`] for what the legacy `false` behaviour costs.
+    pub dir_fix: bool,
+    /// Per-node edge budget (`SHODH_GRAPH_MAX_EDGES`).
+    pub max_edges: usize,
+}
+
+impl Default for TraversalLimits {
+    /// The shipped behaviour: legacy `to_entity`-only traversal, 100 edges/node.
+    fn default() -> Self {
+        Self {
+            dir_fix: false,
+            max_edges: DEFAULT_GRAPH_MAX_EDGES,
+        }
+    }
+}
+
+impl TraversalLimits {
+    /// Read both flags from the environment. Called ONCE, from
+    /// [`spreading_activation_retrieve_with_stats`] — the single live entry
+    /// point of the graph leg. Unset environment yields [`Self::default`], i.e.
+    /// byte-identical behaviour to before the flags existed.
+    pub fn from_env() -> Self {
+        let dir_fix = std::env::var("SHODH_GRAPH_EDGE_DIR")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let max_edges = std::env::var("SHODH_GRAPH_MAX_EDGES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&k| k > 0)
+            .unwrap_or(DEFAULT_GRAPH_MAX_EDGES);
+        Self { dir_fix, max_edges }
+    }
 }
 
 /// Intrinsic (decay-free, degree-free) transition weight of an edge for PPR: the
@@ -696,13 +784,13 @@ fn personalized_pagerank(
     predicate_weights: bool,
     specificity: bool,
     passage_weight: Option<f32>,
+    limits: TraversalLimits,
 ) -> Result<PprOutput> {
     const ALPHA: f32 = 0.5; // restart probability (PPR damping = 0.5)
     const ITERS: usize = 30;
     const TOL: f32 = 1e-6;
     const EXPAND_HOPS: usize = 3;
     const MAX_NODES: usize = 5000;
-    const MAX_EDGES_PER_NODE: usize = 100;
     const MAX_PASSAGES: usize = 4000;
     const MAX_EPISODES_PER_ENTITY: usize = 100;
 
@@ -753,10 +841,10 @@ fn personalized_pagerank(
             break;
         }
         let mut next: Vec<Uuid> = Vec::new();
-        let dir_fix = edge_dir_fix_enabled();
+        let dir_fix = limits.dir_fix;
         for &u in &frontier {
             let ui = ppr_intern(u, &mut nodes, &mut node_idx, &mut adj);
-            let edges = graph.get_entity_relationships_limited(&u, Some(MAX_EDGES_PER_NODE))?;
+            let edges = graph.get_entity_relationships_limited(&u, Some(limits.max_edges))?;
             for edge in edges {
                 let nb = edge_neighbor(&edge, &u, dir_fix);
                 let w = ppr_edge_weight(
@@ -960,10 +1048,10 @@ fn reachable_inject(
     seeds: &HashMap<Uuid, f32>,
     intent: Option<&OntologicalIntent>,
     predicate_weights: bool,
+    limits: TraversalLimits,
 ) -> Result<HashMap<Uuid, f32>> {
     const REACH_HOPS: usize = 2;
     const MAX_NODES: usize = 4000;
-    const MAX_EDGES_PER_NODE: usize = 100;
     const HOP_DECAY: f32 = 0.5;
     // Keep only the strongest-path reachable entities. Threshold-free expansion over a
     // hub (degree 225 on LoCoMo) otherwise floods the candidate set — every reachable
@@ -982,13 +1070,13 @@ fn reachable_inject(
             break;
         }
         let mut next: Vec<Uuid> = Vec::new();
-        let dir_fix = edge_dir_fix_enabled();
+        let dir_fix = limits.dir_fix;
         for &u in &frontier {
             let au = best.get(&u).copied().unwrap_or(0.0);
             if au <= 0.0 {
                 continue;
             }
-            let edges = graph.get_entity_relationships_limited(&u, Some(MAX_EDGES_PER_NODE))?;
+            let edges = graph.get_entity_relationships_limited(&u, Some(limits.max_edges))?;
             for edge in edges {
                 let nb = edge_neighbor(&edge, &u, dir_fix);
                 let w = ppr_edge_weight(
@@ -1021,7 +1109,21 @@ fn reachable_inject(
     // Bound the injected set to the strongest-path reachable entities.
     if best.len() > REACH_MAX_ENTITIES {
         let mut items: Vec<(Uuid, f32)> = best.into_iter().collect();
-        items.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        // `best` is a HashMap, so this Vec arrives in RANDOMISED order, and an
+        // unstable sort on score alone gives ties no defined order at all. The
+        // very next line TRUNCATES, so two entities on equal path strength meant
+        // the injected set — and every rank derived from it — was decided by
+        // hash iteration order rather than by the graph. It shows up as a
+        // retrieval result that changes between two identical queries against
+        // one unchanged store, which is what the harness's repeat-determinism
+        // guard exists to catch.
+        //
+        // Uuid makes the order total and is stable for the lifetime of a store,
+        // which is the scope the guard compares over. It is NOT stable across
+        // two ingests of the same corpus (entity uuids are v4); a cross-ingest
+        // order would have to key on the entity name, and that costs a graph
+        // lookup per candidate inside the hot walk.
+        items.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         items.truncate(REACH_MAX_ENTITIES);
         return Ok(items.into_iter().collect());
     }
@@ -1040,10 +1142,10 @@ fn traverse_beam(
     seeds: &HashMap<Uuid, f32>,
     intent: Option<&OntologicalIntent>,
     predicate_weights: bool,
+    limits: TraversalLimits,
 ) -> Result<HashMap<Uuid, f32>> {
     const HOPS: usize = 2;
     const BEAM: usize = 32;
-    const MAX_EDGES: usize = 100;
 
     struct BeamPath {
         endpoint: Uuid,
@@ -1065,11 +1167,12 @@ fn traverse_beam(
     let mut reached: HashMap<Uuid, f32> = HashMap::new();
     let mut label_cache: HashMap<Uuid, Option<Vec<EntityLabel>>> = HashMap::new();
 
-    let dir_fix = edge_dir_fix_enabled();
+    let dir_fix = limits.dir_fix;
     for _ in 0..HOPS {
         let mut next: Vec<BeamPath> = Vec::new();
         for p in &beam {
-            let edges = graph.get_entity_relationships_limited(&p.endpoint, Some(MAX_EDGES))?;
+            let edges =
+                graph.get_entity_relationships_limited(&p.endpoint, Some(limits.max_edges))?;
             for edge in edges {
                 let nb = edge_neighbor(&edge, &p.endpoint, dir_fix);
                 if p.visited.contains(&nb) {
@@ -1098,7 +1201,15 @@ fn traverse_beam(
         if next.is_empty() {
             break;
         }
-        next.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
+        // Same hazard as the reach cut above: an unstable sort on score alone,
+        // truncated immediately. Paths tie on score routinely here because
+        // `ppr_edge_weight` is a product of a few quantised factors, so which
+        // path survives the beam was undefined. Endpoint makes it total.
+        next.sort_unstable_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.endpoint.cmp(&b.endpoint))
+        });
         next.truncate(BEAM);
         for p in &next {
             let e = reached.entry(p.endpoint).or_insert(0.0);
@@ -1168,6 +1279,11 @@ pub fn spreading_activation_retrieve_with_stats(
     let start_time = Instant::now();
     let mut stats = RetrievalStats::default();
 
+    // The graph leg's structural traversal budget. Read ONCE here - this is the
+    // only `std::env::var` for these two flags in the whole leg; every walk
+    // below receives the value as a parameter. See `TraversalLimits` for why.
+    let limits = TraversalLimits::from_env();
+
     // A/B: unify this leg's recency/arousal/credibility boosts with the semantic leg.
     //
     // The semantic leg applies them MULTIPLICATIVELY — `score × (1.0 + Σ factors)` with
@@ -1184,6 +1300,29 @@ pub fn spreading_activation_retrieve_with_stats(
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
+    // TRUE GRAPH ISOLATION (`SHODH_GRAPH_PURE=1`, diagnostic, default off).
+    //
+    // `SHODH_LEG=graph` isolates the graph's CANDIDATE SET but not its SCORING.
+    // Every graph-reached candidate still gets a `cosine_similarity(query, memory)`
+    // (see the `semantic_score` below), and `fuse_hybrid_score` weights it by
+    // `semantic_weight / sum`. With `graph_weight` pinned at its 0.1 floor on any
+    // corpus whose seed entities average more than 2 edges, that makes the "graph
+    // leg" roughly 75% embedding cosine, 15% linguistic and 10% graph activation.
+    // So every graph-internal lever measured through `SHODH_LEG=graph` could move
+    // at most a tenth of the score, and the vector model was doing the ranking.
+    //
+    // `SHODH_GRAPH_PURE=1` sets the weights to (semantic 0, graph 1, linguistic 0)
+    // so the leg is ranked by graph activation ALONE. This is what "does the
+    // knowledge graph work on its own" actually requires, and it is not reachable
+    // via `SHODH_GRAPH_W_FLOOR`, which clamps at `1.0 - linguistic - 0.05`.
+    //
+    // Diagnostic only: it is not a proposed default, and the floor sweep already
+    // showed that shifting weight toward the graph costs ranking quality
+    // (ndcg 0.4577 -> 0.4481, p@1 0.3638 -> 0.3468 at graph_w ~0.8).
+    let graph_pure = std::env::var("SHODH_GRAPH_PURE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
     // Determine weights based on density
     let (semantic_weight, graph_weight, linguistic_weight) = if let Some(density) = graph_density {
         stats.mode = "associative".to_string();
@@ -1197,6 +1336,13 @@ pub fn spreading_activation_retrieve_with_stats(
             HYBRID_GRAPH_WEIGHT,
             HYBRID_LINGUISTIC_WEIGHT,
         )
+    };
+    // Applied AFTER the density branch so it overrides both paths.
+    let (semantic_weight, graph_weight, linguistic_weight) = if graph_pure {
+        stats.mode = "graph_pure".to_string();
+        (0.0, 1.0, 0.0)
+    } else {
+        (semantic_weight, graph_weight, linguistic_weight)
     };
 
     stats.semantic_weight = semantic_weight;
@@ -1275,16 +1421,38 @@ pub fn spreading_activation_retrieve_with_stats(
     // First pass: collect entities with their salience values
     let mut entity_data: Vec<(Uuid, String, f32, f32)> = Vec::new(); // (uuid, name, ic_weight, salience)
 
+    // A node this build cannot decode must cost the query that ONE seed, not the
+    // whole request. The seed lookup used to propagate the decode error straight
+    // out of `recall`, so a single unreadable node in a 9,000-node graph turned
+    // every default/hybrid/associative recall into a 500 while semantic and
+    // temporal — which never touch the graph leg — kept working.
+    //
+    // Skipping is not the same as hiding: each skip is logged with the name that
+    // could not be resolved, counted, and returned to the caller as
+    // `RetrievalStats::unreadable_graph_nodes`, so a degraded answer is
+    // distinguishable from a complete one.
+    let mut unreadable_graph_nodes = 0usize;
+
     for entity in &analysis.focal_entities {
-        if let Some(entity_node) = graph.find_entity_by_name(&entity.text)? {
-            entity_data.push((
+        match graph.find_entity_by_name(&entity.text) {
+            Ok(Some(entity_node)) => entity_data.push((
                 entity_node.uuid,
                 entity.text.clone(),
                 entity.ic_weight,
                 entity_node.salience,
-            ));
-        } else {
-            tracing::debug!("  ✗ Entity '{}' not found in graph", entity.text);
+            )),
+            Ok(None) => {
+                tracing::debug!("  ✗ Entity '{}' not found in graph", entity.text);
+            }
+            Err(e) => {
+                unreadable_graph_nodes += 1;
+                tracing::warn!(
+                    entity = %entity.text,
+                    error = %e,
+                    "graph seed skipped: its node could not be decoded — this query \
+                     answers without it"
+                );
+            }
         }
     }
 
@@ -1304,15 +1472,26 @@ pub fn spreading_activation_retrieve_with_stats(
             if name.trim().len() < 2 {
                 continue;
             }
-            if let Some(entity_node) = graph.find_entity_by_name(name)? {
-                if !seen.contains(&entity_node.uuid) {
-                    entity_data.push((
-                        entity_node.uuid,
-                        name.clone(),
-                        QUERY_NER_SEED_IC,
-                        entity_node.salience,
-                    ));
-                    added += 1;
+            match graph.find_entity_by_name(name) {
+                Ok(Some(entity_node)) => {
+                    if !seen.contains(&entity_node.uuid) {
+                        entity_data.push((
+                            entity_node.uuid,
+                            name.clone(),
+                            QUERY_NER_SEED_IC,
+                            entity_node.salience,
+                        ));
+                        added += 1;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    unreadable_graph_nodes += 1;
+                    tracing::warn!(
+                        entity = %name,
+                        error = %e,
+                        "query-NER graph seed skipped: its node could not be decoded"
+                    );
                 }
             }
         }
@@ -1363,9 +1542,22 @@ pub fn spreading_activation_retrieve_with_stats(
         0.0
     };
 
+    // Tell the caller the answer was assembled without some of its seeds.
+    stats.unreadable_graph_nodes = unreadable_graph_nodes;
+
     if activation_map.is_empty() {
         tracing::warn!("No entities found in graph, falling back to semantic search");
         stats.retrieval_time_us = start_time.elapsed().as_micros() as u64;
+        // Keep the `graph_pool` funnel denominator aligned with the `graph`
+        // stage (mod.rs records that one even when this leg returns empty):
+        // a no-seed query has an EMPTY pool, not a missing measurement —
+        // omitting it would silently inflate graph_pool.present%.
+        if crate::memory::gold_funnel::is_armed() {
+            crate::memory::gold_funnel::record(
+                "graph_pool",
+                std::iter::empty::<&crate::memory::types::MemoryId>(),
+            );
+        }
         return Ok((Vec::new(), stats)); // Caller should fall back to semantic search
     }
 
@@ -1433,6 +1625,7 @@ pub fn spreading_activation_retrieve_with_stats(
             pred_w,
             specificity,
             passage_weight,
+            limits,
         )?;
         activation_map = ppr_map;
         ppr_passage_map = passage_map;
@@ -1458,6 +1651,7 @@ pub fn spreading_activation_retrieve_with_stats(
             total_salience,
             adaptive_hops,
             intent_ref,
+            limits,
         )?;
 
         activation_map = bidirectional_map;
@@ -1487,7 +1681,7 @@ pub fn spreading_activation_retrieve_with_stats(
         let predicate_weights = std::env::var("SHODH_GRAPH_PREDICATE_WEIGHTS")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        let dir_fix = edge_dir_fix_enabled();
+        let dir_fix = limits.dir_fix;
 
         for hop in 1..=SPREADING_MAX_HOPS {
             stats.graph_hops = hop;
@@ -1516,9 +1710,8 @@ pub fn spreading_activation_retrieve_with_stats(
                 }
 
                 // Get relationships from this entity (limited to prevent blowup)
-                const MAX_EDGES_PER_SPREAD: usize = 100;
-                let edges = graph
-                    .get_entity_relationships_limited(&entity_uuid, Some(MAX_EDGES_PER_SPREAD))?;
+                let edges =
+                    graph.get_entity_relationships_limited(&entity_uuid, Some(limits.max_edges))?;
 
                 // Degree normalization: prevent hub nodes from flooding the network.
                 // Matches bidirectional path (Anderson & Reder 1999 ACT-R).
@@ -1691,7 +1884,7 @@ pub fn spreading_activation_retrieve_with_stats(
         let pred_w = std::env::var("SHODH_GRAPH_PREDICATE_WEIGHTS")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        match reachable_inject(graph, &seed_activations, intent_ref, pred_w) {
+        match reachable_inject(graph, &seed_activations, intent_ref, pred_w, limits) {
             Ok(reach) => {
                 let before = activation_map.len();
                 for (u, a) in reach {
@@ -1722,7 +1915,7 @@ pub fn spreading_activation_retrieve_with_stats(
         let pred_w = std::env::var("SHODH_GRAPH_PREDICATE_WEIGHTS")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        match traverse_beam(graph, &seed_activations, intent_ref, pred_w) {
+        match traverse_beam(graph, &seed_activations, intent_ref, pred_w, limits) {
             Ok(answers) => {
                 let n = answers.len();
                 for (ent, score) in answers {
@@ -1821,14 +2014,57 @@ pub fn spreading_activation_retrieve_with_stats(
 
     let now = crate::memory::scoring_now();
 
+    // SHODH_GRAPH_ACT_NORM: max-normalise the per-episode graph activation to
+    // [0,1] PER QUERY before it meets `fuse_hybrid_score`. The activations
+    // summed above are RAW PPR stationary masses — an L1-conserved probability
+    // distribution over the expanded subgraph (only the PASSAGE map of
+    // `personalized_pagerank` is max-normalised, and that path is off by
+    // default) — so a non-seed-adjacent episode's graph term is O(1e-3)
+    // against a 0..1 cosine: `graph_weight` scales a term whose VALUE is three
+    // orders of magnitude below the semantic term, and the blend degenerates
+    // to semantic+linguistic for exactly the multi-hop candidates the graph
+    // leg exists to surface. This is a SCALE fix, not a weight change: the
+    // per-query max becomes 1.0 and relative activation ordering is preserved.
+    // Default off → byte-identical scores; measure before flipping.
+    let act_norm = std::env::var("SHODH_GRAPH_ACT_NORM")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let act_scale = if act_norm {
+        let max_act = activated_memories
+            .values()
+            .map(|(raw, seeds, _)| {
+                raw * (1.0 + SEED_COVERAGE_BONUS * (seeds.len().saturating_sub(1) as f32))
+            })
+            .fold(0.0_f32, f32::max);
+        if max_act > 0.0 {
+            1.0 / max_act
+        } else {
+            1.0
+        }
+    } else {
+        1.0
+    };
+
+    // SHODH_GRAPH_MAG_DIAG: per-query magnitude census of the two dominant
+    // fusion terms, for settling the scale question empirically at corpus
+    // scale. `1`/`true` prints to stderr (same pattern as TYPED_WALK_DEBUG);
+    // any other non-empty value is a file path the line is APPENDED to, which
+    // is what lets the unit test prove this diagnostic fires on the live path.
+    let mag_diag: Option<String> = std::env::var("SHODH_GRAPH_MAG_DIAG")
+        .ok()
+        .filter(|v| !v.is_empty());
+    let mut mag_sem: Vec<f32> = Vec::new();
+    let mut mag_act: Vec<f32> = Vec::new();
+
     for (_episode_uuid, (raw_activation, covered_seeds, episode)) in activated_memories {
         // G5: scale activation by distinct query-seed coverage. An episode
         // reached by 2 distinct query seeds (e.g. speaker AND topic) is the
         // multi_hop signal; one reached by a single ubiquitous seed (a hub) is
         // not. coverage==1 → ×1.0, so single-seed queries are unaffected.
         let coverage = covered_seeds.len();
-        let graph_activation =
-            raw_activation * (1.0 + SEED_COVERAGE_BONUS * (coverage.saturating_sub(1) as f32));
+        let graph_activation = raw_activation
+            * (1.0 + SEED_COVERAGE_BONUS * (coverage.saturating_sub(1) as f32))
+            * act_scale;
         // Convert episode to memory
         if let Some(memory) = episode_to_memory_fn(&episode)? {
             // Calculate semantic similarity (still needed for ActivatedMemory debug fields)
@@ -1841,6 +2077,11 @@ pub fn spreading_activation_retrieve_with_stats(
             // Calculate linguistic match score (normalized to 0.0-1.0)
             let linguistic_raw = calculate_linguistic_match(&memory, &analysis);
             let linguistic_score = linguistic_raw; // Already normalized in calculate_linguistic_match
+
+            if mag_diag.is_some() {
+                mag_sem.push(semantic_score);
+                mag_act.push(graph_activation);
+            }
 
             // Unified scoring using density-dependent weights (calculated at
             // function start), with the memory-tier trust discount applied to the
@@ -1907,6 +2148,56 @@ pub fn spreading_activation_retrieve_with_stats(
         }
     }
 
+    // One greppable line per query: `GRAPH_MAG n=… sem=min/med/max act=min/med/max
+    // wsem=… wact=…` — the w* fields are the MEDIAN term contributions after
+    // weighting (semantic_weight·med(sem) vs graph_weight·med(act)), i.e. what
+    // each leg actually adds to the blended score for a typical pool candidate.
+    if let Some(diag_dest) = &mag_diag {
+        if !mag_sem.is_empty() {
+            let med = |v: &mut Vec<f32>| -> f32 {
+                v.sort_unstable_by(|a, b| a.total_cmp(b));
+                v[v.len() / 2]
+            };
+            let (sem_min, sem_max) = mag_sem
+                .iter()
+                .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &x| {
+                    (lo.min(x), hi.max(x))
+                });
+            let (act_min, act_max) = mag_act
+                .iter()
+                .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &x| {
+                    (lo.min(x), hi.max(x))
+                });
+            let sem_med = med(&mut mag_sem);
+            let act_med = med(&mut mag_act);
+            let line = format!(
+                "GRAPH_MAG n={} sem={sem_min:.4}/{sem_med:.4}/{sem_max:.4} \
+                 act={act_min:.6}/{act_med:.6}/{act_max:.6} \
+                 wsem={:.6} wact={:.6}",
+                mag_sem.len(),
+                semantic_weight * sem_med,
+                graph_weight * act_med,
+            );
+            if diag_dest == "1" || diag_dest.eq_ignore_ascii_case("true") {
+                eprintln!("{line}");
+            } else {
+                use std::io::Write;
+                match std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(diag_dest)
+                {
+                    Ok(mut f) => {
+                        if let Err(e) = writeln!(f, "{line}") {
+                            tracing::warn!("GRAPH_MAG append to {diag_dest} failed: {e}");
+                        }
+                    }
+                    Err(e) => tracing::warn!("GRAPH_MAG open {diag_dest} failed: {e}"),
+                }
+            }
+        }
+    }
+
     // Step 6: Sort by final score (descending).
     //
     // Content tie-break: without one, equal-score candidates keep the
@@ -1925,6 +2216,23 @@ pub fn spreading_activation_retrieve_with_stats(
         })
     });
 
+    // Funnel stage `graph_pool`: the leg's COMPLETE scored pool, before any
+    // truncation. The existing `graph` stage (mod.rs) sees only the emitted
+    // top-`graph_leg_k` list, so it cannot distinguish "gold never entered the
+    // pool" (a membership problem — seeds, edge direction, expansion caps) from
+    // "gold entered the pool but the final_score ordering cut it at the exit
+    // gate" (an ordering problem the graph cannot fix — the pool ordering is
+    // semantic-dominated because PPR stationary masses are ~1e-3 against 0..1
+    // cosine scores). Recorded on the sorted-but-uncut list so the funnel's
+    // mean_rank_when_present locates WHERE in the pool ordering gold sits.
+    // No-op unless the recall harness armed the funnel for this query.
+    if crate::memory::gold_funnel::is_armed() {
+        crate::memory::gold_funnel::record(
+            "graph_pool",
+            scored_memories.iter().map(|am| &am.memory.id),
+        );
+    }
+
     // Bound the candidate set before the O(n²) lateral-inhibition pass below. The caller
     // keeps only the top ~200 graph candidates anyway, so this loses nothing — but without
     // it, reachability injection's large candidate set makes lateral inhibition (pairwise
@@ -1935,7 +2243,10 @@ pub fn spreading_activation_retrieve_with_stats(
 
     // Step 6.5: Lateral inhibition — high-scoring memories suppress similar competitors
     // Mimics cortical winner-take-all dynamics (Rumelhart & Zipser 1985)
-    if scored_memories.len() > 1 {
+    // Ablatable as the `lateral_inhibition` family (see `memory::ablation`).
+    // This ran unconditionally with no gate anywhere in the repo, so its effect
+    // had never been measured in either direction.
+    if scored_memories.len() > 1 && crate::memory::ablation::is_enabled("lateral_inhibition") {
         let penalties = calculate_lateral_inhibition(&scored_memories);
         for (i, penalty) in penalties.iter().enumerate() {
             scored_memories[i].final_score -= penalty;
@@ -1974,12 +2285,26 @@ pub fn spreading_activation_retrieve_with_stats(
     // Hebbian reinforcement: strengthen edges traversed during spreading activation
     // Other traversal methods (traverse_from_entity, traverse_weighted, traverse_bidirectional)
     // all call batch_strengthen_synapses — spreading activation should too.
-    // SHODH_RECALL_READONLY gate: this is a graph-leg mutation, so read-only
-    // recall (eval repeats) must skip it exactly like the access-count and
+    // Read-only gate: this is a graph-leg mutation, so read-only recall (eval
+    // repeats via the env pin, or a caller that asked for a reproducible answer
+    // via `Query::read_only`) must skip it exactly like the access-count and
     // coactivation writes in mod.rs do — the traversed-edge STATS are still
     // collected above (`stats.traversed_edges`) so diagnostics are unaffected,
     // only the persistent strength MUTATION is skipped.
-    if !stats.traversed_edges.is_empty() && !recall_readonly() {
+    // Two independent suppressors, deliberately separate: the read-only gate is
+    // measurement integrity (no recall-path writes during an eval), while the
+    // `graph_potentiation` family ablates THIS mechanism alone. Keeping them
+    // apart is what allows the potentiation write to be measured against a live
+    // run rather than only against a frozen one.
+    //
+    // The read-only side takes the QUERY, not the process: `recall_is_readonly`
+    // is `recall_readonly_env() || query.read_only`, so it strictly subsumes the
+    // process-wide env read it replaces here. A caller that asked for a
+    // read-only recall is honoured even when the process was never pinned.
+    if !stats.traversed_edges.is_empty()
+        && !recall_is_readonly(query)
+        && crate::memory::ablation::is_enabled("graph_potentiation")
+    {
         if let Err(e) = graph.batch_strengthen_synapses(&stats.traversed_edges) {
             tracing::debug!("Spreading activation edge strengthening failed: {}", e);
         }
@@ -2313,8 +2638,11 @@ mod tests {
         seeds.insert(hub, 1.0_f32);
         seeds.insert(rare, 1.0_f32);
 
-        let (off, _, _) = personalized_pagerank(&graph, &seeds, None, false, false, None).unwrap();
-        let (on, _, _) = personalized_pagerank(&graph, &seeds, None, false, true, None).unwrap();
+        let lim = TraversalLimits::default();
+        let (off, _, _) =
+            personalized_pagerank(&graph, &seeds, None, false, false, None, lim).unwrap();
+        let (on, _, _) =
+            personalized_pagerank(&graph, &seeds, None, false, true, None, lim).unwrap();
 
         let off_h = off.get(&target_h).copied().unwrap_or(0.0);
         let off_r = off.get(&target_r).copied().unwrap_or(0.0);
@@ -2417,12 +2745,28 @@ mod tests {
         seeds.insert(a, 1.0_f32);
 
         // Flag off: no passage map.
-        let (_, no_passages, _) =
-            personalized_pagerank(&graph, &seeds, None, false, false, None).unwrap();
+        let (_, no_passages, _) = personalized_pagerank(
+            &graph,
+            &seeds,
+            None,
+            false,
+            false,
+            None,
+            TraversalLimits::default(),
+        )
+        .unwrap();
         assert!(no_passages.is_empty(), "passages off must return empty map");
 
-        let (entities, passages, _) =
-            personalized_pagerank(&graph, &seeds, None, false, false, Some(0.5)).unwrap();
+        let (entities, passages, _) = personalized_pagerank(
+            &graph,
+            &seeds,
+            None,
+            false,
+            false,
+            Some(0.5),
+            TraversalLimits::default(),
+        )
+        .unwrap();
 
         let bridge_mass = passages.get(&bridge_id).copied().unwrap_or(0.0);
         let solo_mass = passages.get(&solo_id).copied().unwrap_or(0.0);
@@ -2441,6 +2785,373 @@ mod tests {
             entities.get(&b).copied().unwrap_or(0.0) > 0.0,
             "entity→entity spreading must survive passage interning"
         );
+    }
+
+    /// The `graph_pool` funnel stage must see the COMPLETE scored pool —
+    /// recorded after the final-score sort but BEFORE the GRAPH_CANDIDATE_CAP
+    /// (200) and `graph_leg_k` truncations — on the live retrieval path.
+    ///
+    /// Construction: one seed entity with 202 attached episodes, all with
+    /// identical evidence (equal activation, no embeddings, no query-token
+    /// overlap), so the deterministic content tie-break is the total order.
+    /// The gold episode's content sorts LAST → pool rank 201, beyond both the
+    /// 200-cap and the emitted top-`max_results`. A mutation that removes the
+    /// record, or moves it after either truncation, changes the recorded rank
+    /// to absent/None and fails the exact-rank assertion.
+    #[test]
+    fn graph_pool_funnel_stage_records_the_pool_before_truncation() {
+        use crate::graph_memory::{EntityNode, EpisodeSource};
+        use crate::memory::types::{Experience, MemoryId};
+        use chrono::Utc;
+        use std::sync::Arc;
+
+        struct StubEmbedder;
+        impl crate::embeddings::Embedder for StubEmbedder {
+            fn encode(&self, _text: &str) -> Result<Vec<f32>> {
+                Ok(vec![0.1, 0.2, 0.3, 0.4])
+            }
+            fn dimension(&self) -> usize {
+                4
+            }
+        }
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+
+        let hub = graph
+            .add_entity(EntityNode {
+                uuid: Uuid::new_v4(),
+                name: "hub".to_string(),
+                labels: vec![EntityLabel::Concept],
+                created_at: Utc::now(),
+                last_seen_at: Utc::now(),
+                mention_count: 1,
+                summary: String::new(),
+                attributes: HashMap::new(),
+                name_embedding: None,
+                salience: 1.0,
+                is_proper_noun: false,
+                selectivity: None,
+                fine_type: None,
+                kb_id: None,
+            })
+            .unwrap();
+
+        // 201 distractors that sort BEFORE the gold by content, plus one gold
+        // that sorts last. All evidence is identical, so the content tie-break
+        // (total order) pins gold to pool rank 201 — outside the 200-cap.
+        let now = Utc::now();
+        let add_episode = |content: String| -> Uuid {
+            let ep = EpisodicNode {
+                uuid: Uuid::new_v4(),
+                name: content.clone(),
+                content,
+                valid_at: now,
+                created_at: now,
+                entity_refs: vec![hub],
+                source: EpisodeSource::Message,
+                metadata: HashMap::new(),
+            };
+            let id = ep.uuid;
+            graph.add_episode(ep).unwrap();
+            id
+        };
+        for i in 0..201 {
+            add_episode(format!("content_{i:03}"));
+        }
+        let gold_uuid = add_episode("zzz_gold".to_string());
+
+        let episode_to_memory = |ep: &EpisodicNode| -> Result<Option<SharedMemory>> {
+            Ok(Some(Arc::new(Memory::new(
+                MemoryId(ep.uuid),
+                Experience {
+                    content: ep.content.clone(),
+                    ..Default::default()
+                },
+                0.5,
+                None,
+                None,
+                None,
+                Some(now),
+            ))))
+        };
+
+        let query = Query {
+            query_text: Some("hub".to_string()),
+            ner_entities: Some(vec!["hub".to_string()]),
+            ..Query::default()
+        };
+
+        let mut gold_set = HashSet::new();
+        gold_set.insert(MemoryId(gold_uuid));
+        crate::memory::gold_funnel::begin(gold_set);
+
+        let (emitted, _stats) = spreading_activation_retrieve_with_stats(
+            "hub",
+            &query,
+            &graph,
+            &StubEmbedder,
+            None,
+            None,
+            None,
+            episode_to_memory,
+        )
+        .expect("graph-leg retrieval");
+
+        let stages = crate::memory::gold_funnel::take().expect("funnel was armed");
+        let pool_rank = stages
+            .iter()
+            .find(|(stage, _)| stage == "graph_pool")
+            .unwrap_or_else(|| panic!("graph_pool stage must be recorded; got {stages:?}"))
+            .1;
+        assert_eq!(
+            pool_rank,
+            Some(201),
+            "graph_pool must rank gold in the FULL sorted pool (202 candidates, \
+             gold last by content tie-break). None/absent means the record was \
+             dropped or moved after a truncation"
+        );
+
+        // And the emitted leg output must NOT contain the gold — the record
+        // observed candidates the exit gate cut, which is its entire purpose.
+        assert!(
+            emitted.len() <= query.max_results,
+            "leg emission must respect graph_leg_k (= max_results here)"
+        );
+        assert!(
+            emitted.iter().all(|am| am.memory.id != MemoryId(gold_uuid)),
+            "gold at pool rank 201 must be cut by the exit gate in this construction"
+        );
+    }
+
+    /// Pins the SCALE facts about the graph term of `fuse_hybrid_score`, on
+    /// the live retrieval path:
+    ///
+    /// 1. Default: per-episode graph activation is a RAW PPR stationary mass —
+    ///    an L1-conserved probability (sum over the pool ≤ 1, max well below
+    ///    1.0) — while the semantic term is a 0..1 cosine. `graph_weight`
+    ///    therefore scales a term whose VALUE is orders of magnitude smaller,
+    ///    and at corpus scale (thousands of nodes sharing unit mass) the graph
+    ///    term degenerates to ~1e-3.
+    /// 2. `SHODH_GRAPH_ACT_NORM=1` max-normalises activation per query: the
+    ///    pool max becomes exactly 1.0 and relative ratios are preserved (a
+    ///    scale fix, not a reweighting).
+    /// 3. `SHODH_GRAPH_MAG_DIAG=<path>` appends one `GRAPH_MAG` line per query
+    ///    whose fields match the values actually fused.
+    ///
+    /// Mutations that must fail this test: skipping the normalisation,
+    /// applying it unconditionally, or dropping the diagnostic write.
+    #[test]
+    fn act_norm_rescales_raw_ppr_masses_and_mag_diag_reports_them() {
+        use crate::graph_memory::{
+            EdgeTier, EntityLabel, EntityNode, EpisodeSource, EpisodicNode, GraphMemory, LtpStatus,
+            RelationType, RelationshipEdge,
+        };
+        use crate::memory::types::{Experience, MemoryId};
+        use chrono::Utc;
+        use std::sync::Arc;
+
+        const EMB: [f32; 4] = [0.1, 0.2, 0.3, 0.4];
+        struct StubEmbedder;
+        impl crate::embeddings::Embedder for StubEmbedder {
+            fn encode(&self, _text: &str) -> Result<Vec<f32>> {
+                Ok(EMB.to_vec())
+            }
+            fn dimension(&self) -> usize {
+                4
+            }
+        }
+
+        // Read-only recall for the whole test: each retrieval otherwise
+        // Hebbian-strengthens the traversed edges, so phase 1's PPR masses
+        // would differ from phase 0's and the ratio assertion below would
+        // compare two different graphs. Taking the shared env lock keeps this
+        // from racing `spreading_activation_readonly_gate_skips_hebbian_strengthening`,
+        // which asserts BOTH states of the same variable.
+        // The crate-wide lock, not a module-local one: SHODH_RECALL_READONLY is
+        // process state, so a mutex private to this module would not exclude a
+        // test in a sibling that reads or writes the same variable.
+        let _env_guard = crate::memory::RECALL_ENV_LOCK.lock();
+        std::env::set_var("SHODH_RECALL_READONLY", "1");
+        // Defensive: these are read at call time inside the leg.
+        std::env::remove_var("SHODH_GRAPH_ACT_NORM");
+        std::env::remove_var("SHODH_GRAPH_MAG_DIAG");
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+
+        let mk_entity = |name: &str| EntityNode {
+            uuid: Uuid::new_v4(),
+            name: name.to_string(),
+            labels: vec![EntityLabel::Concept],
+            created_at: Utc::now(),
+            last_seen_at: Utc::now(),
+            mention_count: 1,
+            summary: String::new(),
+            attributes: HashMap::new(),
+            name_embedding: None,
+            salience: 1.0,
+            is_proper_noun: false,
+            selectivity: None,
+            fine_type: None,
+            kb_id: None,
+        };
+        let alpha = graph.add_entity(mk_entity("alphaseed")).unwrap();
+        let beta = graph.add_entity(mk_entity("betamid")).unwrap();
+        let gamma = graph.add_entity(mk_entity("gammafar")).unwrap();
+        let now = Utc::now();
+        let add_edge = |from: Uuid, to: Uuid| {
+            graph
+                .add_relationship(RelationshipEdge {
+                    uuid: Uuid::new_v4(),
+                    from_entity: from,
+                    to_entity: to,
+                    relation_type: RelationType::RelatedTo,
+                    strength: 0.5,
+                    created_at: now,
+                    valid_at: now,
+                    invalidated_at: None,
+                    source_episode_id: None,
+                    context: String::new(),
+                    last_activated: now,
+                    activation_count: 1,
+                    ltp_status: LtpStatus::None,
+                    activation_timestamps: None,
+                    tier: EdgeTier::L2Episodic,
+                    entity_confidence: None,
+                    forman_curvature: None,
+                    endpoint_selectivity: None,
+                    provenance: Vec::new(),
+                    promoted_at: None,
+                })
+                .unwrap();
+        };
+        add_edge(alpha, beta);
+        add_edge(beta, gamma);
+
+        let mk_episode = |name: &str, refs: Vec<Uuid>| {
+            let ep = EpisodicNode {
+                uuid: Uuid::new_v4(),
+                name: name.to_string(),
+                content: name.to_string(),
+                valid_at: now,
+                created_at: now,
+                entity_refs: refs,
+                source: EpisodeSource::Message,
+                metadata: HashMap::new(),
+            };
+            let id = ep.uuid;
+            graph.add_episode(ep).unwrap();
+            id
+        };
+        let ep_seed = mk_episode("near the seed", vec![alpha]);
+        let ep_far = mk_episode("two hops out", vec![gamma]);
+
+        let episode_to_memory = |ep: &EpisodicNode| -> Result<Option<SharedMemory>> {
+            Ok(Some(Arc::new(Memory::new(
+                MemoryId(ep.uuid),
+                Experience {
+                    content: ep.content.clone(),
+                    embeddings: Some(EMB.to_vec()),
+                    ..Default::default()
+                },
+                0.5,
+                None,
+                None,
+                None,
+                Some(now),
+            ))))
+        };
+
+        let query = Query {
+            query_text: Some("alphaseed".to_string()),
+            ner_entities: Some(vec!["alphaseed".to_string()]),
+            ..Query::default()
+        };
+        let run = || -> HashMap<Uuid, (f32, f32)> {
+            let (emitted, _) = spreading_activation_retrieve_with_stats(
+                "alphaseed",
+                &query,
+                &graph,
+                &StubEmbedder,
+                None,
+                None,
+                None,
+                episode_to_memory,
+            )
+            .expect("graph-leg retrieval");
+            emitted
+                .into_iter()
+                .map(|am| (am.memory.id.0, (am.activation_score, am.semantic_score)))
+                .collect()
+        };
+
+        // --- Phase 0: default. Activations are RAW stationary masses. ---
+        let base = run();
+        let (act_seed, sem_seed) = base[&ep_seed];
+        let (act_far, sem_far) = base[&ep_far];
+        assert!(
+            sem_seed > 0.99 && sem_far > 0.99,
+            "identical embeddings must give ~1.0 cosine (got {sem_seed}, {sem_far})"
+        );
+        assert!(
+            act_far > 0.0 && act_far < act_seed,
+            "mass must decay with hops: far={act_far} seed={act_seed}"
+        );
+        assert!(
+            act_seed + act_far <= 1.01,
+            "raw PPR masses are L1-conserved; sum {} must not exceed unit mass",
+            act_seed + act_far
+        );
+        assert!(
+            act_seed < 0.9,
+            "default activation must be the RAW stationary mass (max well below \
+             1.0), not a normalised score — got {act_seed}"
+        );
+
+        // --- Phase 1: SHODH_GRAPH_ACT_NORM=1 rescales, preserving ratios. ---
+        std::env::set_var("SHODH_GRAPH_ACT_NORM", "1");
+        let normed = run();
+        std::env::remove_var("SHODH_GRAPH_ACT_NORM");
+        let (nact_seed, _) = normed[&ep_seed];
+        let (nact_far, _) = normed[&ep_far];
+        assert!(
+            (nact_seed - 1.0).abs() < 1e-4,
+            "normalised pool max must be exactly 1.0, got {nact_seed}"
+        );
+        let expected_ratio = act_far / act_seed;
+        assert!(
+            (nact_far - expected_ratio).abs() < 1e-4,
+            "normalisation must preserve relative activation ({nact_far} vs {expected_ratio})"
+        );
+
+        // --- Phase 2: SHODH_GRAPH_MAG_DIAG=<path> reports the fused values. ---
+        let diag_path = temp_dir.path().join("graph_mag.log");
+        std::env::set_var("SHODH_GRAPH_MAG_DIAG", &diag_path);
+        let _ = run();
+        std::env::remove_var("SHODH_GRAPH_MAG_DIAG");
+        let diag = std::fs::read_to_string(&diag_path)
+            .expect("SHODH_GRAPH_MAG_DIAG=<path> must append the census to the file");
+        let line = diag
+            .lines()
+            .find(|l| l.starts_with("GRAPH_MAG n=2 "))
+            .unwrap_or_else(|| panic!("expected a GRAPH_MAG line for this 2-episode pool: {diag}"));
+        // act max field must be the RAW seed mass fused in phase 0.
+        let act_field = line
+            .split_whitespace()
+            .find_map(|t| t.strip_prefix("act="))
+            .expect("GRAPH_MAG line carries an act= field");
+        let act_max: f32 = act_field
+            .split('/')
+            .nth(2)
+            .and_then(|s| s.parse().ok())
+            .expect("act=min/med/max parses");
+        assert!(
+            (act_max - act_seed).abs() < 1e-4,
+            "diagnostic act max ({act_max}) must equal the fused raw activation ({act_seed})"
+        );
+
+        std::env::remove_var("SHODH_RECALL_READONLY");
     }
 
     #[test]
@@ -2832,11 +3543,6 @@ mod tests {
         assert!(min_threshold < 1.0);
     }
 
-    /// Process-global lock for tests that manipulate `SHODH_RECALL_READONLY`.
-    /// `env::set_var`/`remove_var` are not thread-safe against concurrent
-    /// readers on other test threads (same pattern as `auth.rs`'s `ENV_LOCK`).
-    static RECALL_READONLY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Regression test for the measurement-integrity bug: spreading activation's
     /// Hebbian reinforcement (`graph.batch_strengthen_synapses` on the traversed
     /// edges) ran unconditionally, never checking `SHODH_RECALL_READONLY`. Every
@@ -2844,7 +3550,7 @@ mod tests {
     /// repeat N+1 of the same query saw different (stronger) edges than repeat
     /// N purely from having been queried once already — a same-system A/B
     /// confound the eval harness's read-only gate exists specifically to
-    /// prevent (see `recall_readonly()`'s doc comment in `memory/mod.rs`).
+    /// prevent (see `recall_is_readonly()`'s doc comment in `memory/mod.rs`).
     ///
     /// Asserts: under the flag, two recall passes leave the traversed edge's
     /// strength byte-identical; with the flag unset (production default), the
@@ -2857,13 +3563,9 @@ mod tests {
         };
         use chrono::Utc;
 
-        let _env_guard = RECALL_READONLY_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        // Defensive reset (matches auth.rs's `clear_auth_env` idiom): don't
-        // trust a prior test's cleanup, since `recall_readonly()` re-reads the
-        // env on every call rather than caching it.
-        std::env::remove_var("SHODH_RECALL_READONLY");
+        // Holds the crate-wide lock and restores the previous value on drop, so
+        // this test cannot leak its own pin the way the harness tests did.
+        let _env = crate::memory::RecallEnvPin::pin("0");
 
         struct StubEmbedder;
         impl crate::embeddings::Embedder for StubEmbedder {
@@ -2940,7 +3642,187 @@ mod tests {
         let embedder = StubEmbedder;
         let episode_to_memory = |_ep: &EpisodicNode| -> Result<Option<SharedMemory>> { Ok(None) };
 
-        let run_recall = || {
+        let run_recall = |q: &Query| {
+            spreading_activation_retrieve_with_stats(
+                "widget",
+                q,
+                &graph,
+                &embedder,
+                None,
+                None,
+                None,
+                episode_to_memory,
+            )
+        };
+
+        // Sanity: the graph leg must actually traverse the widget->gadget edge,
+        // or the assertions below would hold vacuously (nothing to strengthen).
+        let (_, sanity_stats) = run_recall(&query).expect("sanity recall");
+        assert!(
+            sanity_stats.traversed_edges.contains(&edge_uuid),
+            "spreading activation must traverse the seeded edge for this test \
+             to exercise the Hebbian-strengthening gate; traversed={:?}",
+            sanity_stats.traversed_edges
+        );
+
+        // --- the env pin feeds the gate ---
+        //
+        // Asserted with NO recall inside the window. `SHODH_RECALL_READONLY=1`
+        // is process-wide: every other test thread reads it for as long as it
+        // is set, and a mutex serialises the writers, not those readers. So the
+        // window here is two `recall_is_readonly` calls rather than two full
+        // spreading-activation passes. What the gate then DOES with a `true`
+        // answer is proven below against this same fixture via the per-request
+        // flag — `recall_is_readonly` is the single input the graph leg
+        // consults, so env -> gate and gate -> no-write compose.
+        {
+            let _pin_on = crate::memory::RecallEnvPin::pin("1");
+            assert!(
+                crate::memory::recall_is_readonly(&query),
+                "SHODH_RECALL_READONLY=1 must make the recall read-only even \
+                 though the request did not ask for it"
+            );
+        }
+        assert!(
+            !crate::memory::recall_is_readonly(&query),
+            "the nested pin must restore the explicit 0 this test holds"
+        );
+
+        // --- read-only recall: two passes, byte-identical strength ---
+        let readonly_query = Query {
+            read_only: true,
+            ..query.clone()
+        };
+        let strength_ro_0 = strength_of(&graph);
+        run_recall(&readonly_query).expect("recall #1 (read-only)");
+        let strength_ro_1 = strength_of(&graph);
+        run_recall(&readonly_query).expect("recall #2 (read-only)");
+        let strength_ro_2 = strength_of(&graph);
+
+        assert_eq!(
+            strength_ro_0.to_bits(),
+            strength_ro_1.to_bits(),
+            "a read-only recall must leave edge strength byte-identical \
+             after recall #1 (got {strength_ro_0} -> {strength_ro_1}) — this is \
+             the graph-leg Hebbian-strengthening leak this test guards against"
+        );
+        assert_eq!(
+            strength_ro_1.to_bits(),
+            strength_ro_2.to_bits(),
+            "a read-only recall must leave edge strength byte-identical \
+             after recall #2 (got {strength_ro_1} -> {strength_ro_2})"
+        );
+
+        // --- production default (gate off): strengthening still happens ---
+        let strength_prod_0 = strength_of(&graph);
+        run_recall(&query).expect("recall #3 (production default)");
+        let strength_prod_1 = strength_of(&graph);
+
+        assert!(
+            strength_prod_1 > strength_prod_0,
+            "gate off (production default) must still strengthen the \
+             traversed edge (Hebbian learning), got {strength_prod_0} -> {strength_prod_1}"
+        );
+    }
+
+    /// The same graph-leg gate, reached through the PER-REQUEST flag rather than
+    /// the process-wide env pin, with the pin explicitly unset throughout.
+    ///
+    /// The pin is a property of the process. A server handling concurrent
+    /// callers cannot use it to answer one request without learning, so
+    /// "reproducible" was not something the HTTP path could offer: run the same
+    /// query twice and the second answer comes from a corpus the first altered.
+    /// `Query::read_only` is that missing per-request capability, and this test
+    /// exists because a flag that is simply ignored produces byte-identical
+    /// state too — so it also proves the same edge DOES strengthen when the
+    /// flag is off, on the same fixture, in the same run.
+    #[test]
+    fn spreading_activation_per_request_readonly_flag_skips_hebbian_strengthening() {
+        use crate::graph_memory::{
+            EdgeTier, EntityLabel, EntityNode, GraphMemory, LtpStatus, RelationType,
+            RelationshipEdge,
+        };
+        use chrono::Utc;
+
+        // The pin is explicitly OFF for this whole test: the claim under test
+        // is that the per-request flag ALONE suppresses the write. An explicit
+        // "0" rather than an unset variable, so no only-if-unset writer can
+        // turn it on underneath the assertion.
+        let _env = crate::memory::RecallEnvPin::pin("0");
+
+        struct StubEmbedder;
+        impl crate::embeddings::Embedder for StubEmbedder {
+            fn encode(&self, _text: &str) -> Result<Vec<f32>> {
+                Ok(vec![0.1, 0.2, 0.3, 0.4])
+            }
+            fn dimension(&self) -> usize {
+                4
+            }
+        }
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+
+        let mk_entity = |name: &str| EntityNode {
+            uuid: Uuid::new_v4(),
+            name: name.to_string(),
+            labels: vec![EntityLabel::Concept],
+            created_at: Utc::now(),
+            last_seen_at: Utc::now(),
+            mention_count: 1,
+            summary: String::new(),
+            attributes: HashMap::new(),
+            name_embedding: None,
+            salience: 1.0,
+            is_proper_noun: false,
+            selectivity: None,
+            fine_type: None,
+            kb_id: None,
+        };
+        let widget = graph.add_entity(mk_entity("widget")).unwrap();
+        let gadget = graph.add_entity(mk_entity("gadget")).unwrap();
+
+        let now = Utc::now();
+        let edge_uuid = graph
+            .add_relationship(RelationshipEdge {
+                uuid: Uuid::new_v4(),
+                from_entity: widget,
+                to_entity: gadget,
+                relation_type: RelationType::RelatedTo,
+                strength: 0.5,
+                created_at: now,
+                valid_at: now,
+                invalidated_at: None,
+                source_episode_id: None,
+                context: String::new(),
+                last_activated: now,
+                activation_count: 1,
+                ltp_status: LtpStatus::None,
+                activation_timestamps: None,
+                tier: EdgeTier::L2Episodic,
+                entity_confidence: None,
+                forman_curvature: None,
+                endpoint_selectivity: None,
+                provenance: Vec::new(),
+                promoted_at: None,
+            })
+            .unwrap();
+
+        let strength_of = |g: &GraphMemory| -> f32 {
+            g.get_relationship(&edge_uuid)
+                .unwrap()
+                .expect("edge must still exist")
+                .strength
+        };
+
+        let embedder = StubEmbedder;
+        let episode_to_memory = |_ep: &EpisodicNode| -> Result<Option<SharedMemory>> { Ok(None) };
+        let run_recall = |read_only: bool| {
+            let query = Query {
+                query_text: Some("widget".to_string()),
+                read_only,
+                ..Query::default()
+            };
             spreading_activation_retrieve_with_stats(
                 "widget",
                 &query,
@@ -2953,52 +3835,436 @@ mod tests {
             )
         };
 
-        // Sanity: the graph leg must actually traverse the widget->gadget edge,
-        // or the assertions below would hold vacuously (nothing to strengthen).
-        let (_, sanity_stats) = run_recall().expect("sanity recall");
+        // Sanity: the graph leg must traverse the seeded edge, or "strength did
+        // not change" would hold vacuously.
+        let (_, sanity_stats) = run_recall(true).expect("sanity recall");
         assert!(
             sanity_stats.traversed_edges.contains(&edge_uuid),
             "spreading activation must traverse the seeded edge for this test \
-             to exercise the Hebbian-strengthening gate; traversed={:?}",
+             to exercise the gate; traversed={:?}",
             sanity_stats.traversed_edges
         );
 
-        // --- SHODH_RECALL_READONLY=1: two passes, byte-identical strength ---
-        std::env::set_var("SHODH_RECALL_READONLY", "1");
-
+        // --- read_only: true — two passes, byte-identical strength ---
         let strength_ro_0 = strength_of(&graph);
-        run_recall().expect("recall #1 (read-only)");
+        run_recall(true).expect("recall #1 (read-only)");
         let strength_ro_1 = strength_of(&graph);
-        run_recall().expect("recall #2 (read-only)");
+        run_recall(true).expect("recall #2 (read-only)");
         let strength_ro_2 = strength_of(&graph);
 
         assert_eq!(
             strength_ro_0.to_bits(),
             strength_ro_1.to_bits(),
-            "SHODH_RECALL_READONLY=1 must leave edge strength byte-identical \
-             after recall #1 (got {strength_ro_0} -> {strength_ro_1}) — this is \
-             the graph-leg Hebbian-strengthening leak this test guards against"
+            "Query::read_only=true must leave edge strength byte-identical \
+             after recall #1 (got {strength_ro_0} -> {strength_ro_1})"
         );
         assert_eq!(
             strength_ro_1.to_bits(),
             strength_ro_2.to_bits(),
-            "SHODH_RECALL_READONLY=1 must leave edge strength byte-identical \
+            "Query::read_only=true must leave edge strength byte-identical \
              after recall #2 (got {strength_ro_1} -> {strength_ro_2})"
         );
 
-        // --- production default (flag unset): strengthening still happens ---
-        std::env::remove_var("SHODH_RECALL_READONLY");
-
+        // --- read_only: false — the default still learns ---
+        // Without this the test would pass just as well against a flag nobody
+        // reads, because an inert pipeline is also byte-identical.
         let strength_prod_0 = strength_of(&graph);
-        run_recall().expect("recall #3 (production default)");
+        run_recall(false).expect("recall #3 (default)");
         let strength_prod_1 = strength_of(&graph);
 
         assert!(
             strength_prod_1 > strength_prod_0,
-            "flag unset (production default) must still strengthen the \
-             traversed edge (Hebbian learning), got {strength_prod_0} -> {strength_prod_1}"
+            "read_only=false (product default) must still strengthen the \
+             traversed edge — the flag adds a mode, it does not remove \
+             reinforcement-on-read; got {strength_prod_0} -> {strength_prod_1}"
+        );
+    }
+
+    // =========================================================================
+    // REACH: what the graph leg can even see.
+    //
+    // `analyze_graph_reachability` (recall_harness/runner.rs) reports gold as
+    // <=2-hop reachable for 97.9% of held-out LoCoMo cases, while the graph leg
+    // surfaces 89.3% at depth 100. The two numbers were measured over DIFFERENT
+    // graphs: the diagnostic walks `[e.from_entity, e.to_entity]` (undirected)
+    // with `get_entity_relationships` (no per-node cap); the leg walks
+    // `edge_neighbor` (which resolves to `edge.to_entity` unless
+    // `SHODH_GRAPH_EDGE_DIR` is set) with a 100-edge-per-node cap.
+    //
+    // These tests pin BOTH structural losses and both recoveries.
+    // =========================================================================
+
+    /// Serializes the tests that mutate `SHODH_GRAPH_EDGE_DIR` /
+    /// `SHODH_GRAPH_MAX_EDGES`. `TraversalLimits::from_env` reads the process
+    /// environment, and Rust runs tests multi-threaded in ONE process, so an
+    /// unguarded `set_var` leaks into every concurrent reader (same pattern as
+    /// `RECALL_ENV_LOCK`). Tests that exercise the traversal itself
+    /// take `TraversalLimits` as a VALUE and need no lock at all — that is the
+    /// point of threading it as a parameter.
+    // Was a module-local mutex. It is the crate-wide lock now, because a
+    // private one excludes only this module's tests: these flags change what
+    // the RECALL PATH does, so a test in a sibling module measuring recall
+    // while one of these is flipped silently measures a different pipeline
+    // and reports the number as if it measured the shipped one. Third time
+    // this shape has appeared in this branch.
+    use crate::memory::RECALL_ENV_LOCK as TRAVERSAL_ENV_LOCK;
+
+    /// A bare `GraphMemory` plus entity/edge constructors, for the reach tests.
+    fn reach_fixture() -> (tempfile::TempDir, crate::graph_memory::GraphMemory) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = crate::graph_memory::GraphMemory::new(temp_dir.path(), None).unwrap();
+        (temp_dir, graph)
+    }
+
+    fn add_named_entity(graph: &crate::graph_memory::GraphMemory, name: &str) -> Uuid {
+        use crate::graph_memory::{EntityLabel, EntityNode};
+        use chrono::Utc;
+        graph
+            .add_entity(EntityNode {
+                uuid: Uuid::new_v4(),
+                name: name.to_string(),
+                labels: vec![EntityLabel::Concept],
+                created_at: Utc::now(),
+                last_seen_at: Utc::now(),
+                mention_count: 1,
+                summary: String::new(),
+                attributes: HashMap::new(),
+                name_embedding: None,
+                salience: 1.0,
+                is_proper_noun: false,
+                selectivity: None,
+                fine_type: None,
+                kb_id: None,
+            })
+            .unwrap()
+    }
+
+    fn add_directed_edge(
+        graph: &crate::graph_memory::GraphMemory,
+        from: Uuid,
+        to: Uuid,
+        strength: f32,
+    ) -> Uuid {
+        use crate::graph_memory::{EdgeTier, LtpStatus, RelationType, RelationshipEdge};
+        use chrono::Utc;
+        let now = Utc::now();
+        graph
+            .add_relationship(RelationshipEdge {
+                uuid: Uuid::new_v4(),
+                from_entity: from,
+                to_entity: to,
+                relation_type: RelationType::RelatedTo,
+                strength,
+                created_at: now,
+                valid_at: now,
+                invalidated_at: None,
+                source_episode_id: None,
+                context: String::new(),
+                last_activated: now,
+                activation_count: 1,
+                ltp_status: LtpStatus::None,
+                activation_timestamps: None,
+                tier: EdgeTier::L2Episodic,
+                entity_confidence: None,
+                forman_curvature: None,
+                endpoint_selectivity: None,
+                provenance: Vec::new(),
+                promoted_at: None,
+            })
+            .unwrap()
+    }
+
+    /// `GraphMemory::index_entity_edge` is called for BOTH endpoints
+    /// (graph_memory.rs), so an entity's edge list contains its INCOMING edges
+    /// too — but `edge_neighbor` with `dir_fix = false` returns `edge.to_entity`
+    /// unconditionally, which for an incoming edge is the source node itself. A
+    /// co-occurrence edge's stored direction is NER surface order (handlers/
+    /// state.rs sets `from = entity[i]`, `to = entity[j]`, `i < j`) and
+    /// `add_relationship` dedups on an order-independent pair key, so exactly
+    /// one of the two endpoints can ever walk any given edge: |E| of the 2|E|
+    /// endpoint incidences are dead in the default path.
+    ///
+    /// Here the ONLY edge into the seed is stored `gold -> seed`, so the legacy
+    /// walk cannot leave the seed at all.
+    #[test]
+    fn edge_direction_fix_recovers_incoming_only_neighbours() {
+        let (_dir, graph) = reach_fixture();
+        let seed = add_named_entity(&graph, "seedword");
+        let gold = add_named_entity(&graph, "goldword");
+        // Stored direction points AT the seed.
+        add_directed_edge(&graph, gold, seed, 0.8);
+
+        // Precondition: the edge IS in the seed's adjacency (indexed under both
+        // endpoints), so any miss below is the traversal's, not the index's.
+        assert_eq!(
+            graph
+                .get_entity_relationships_limited(&seed, Some(16))
+                .unwrap()
+                .len(),
+            1,
+            "the incoming edge must be indexed under the seed"
         );
 
-        std::env::remove_var("SHODH_RECALL_READONLY");
+        let mut seeds = HashMap::new();
+        seeds.insert(seed, 1.0_f32);
+
+        let legacy = TraversalLimits {
+            dir_fix: false,
+            max_edges: DEFAULT_GRAPH_MAX_EDGES,
+        };
+        let (activation_legacy, _, _) =
+            personalized_pagerank(&graph, &seeds, None, false, false, None, legacy).unwrap();
+        assert!(
+            !activation_legacy.contains_key(&gold),
+            "legacy to_entity-only traversal must NOT reach a node that is only \
+             reachable across an incoming edge (this is the shipped behaviour \
+             the flag exists to change); activated={activation_legacy:?}"
+        );
+
+        let fixed = TraversalLimits {
+            dir_fix: true,
+            max_edges: DEFAULT_GRAPH_MAX_EDGES,
+        };
+        let (activation_fixed, _, _) =
+            personalized_pagerank(&graph, &seeds, None, false, false, None, fixed).unwrap();
+        assert!(
+            activation_fixed.get(&gold).copied().unwrap_or(0.0) > 0.0,
+            "dir_fix must resolve the edge to its true non-source endpoint and \
+             give the gold entity stationary mass; activated={activation_fixed:?}"
+        );
+    }
+
+    /// The per-node edge budget is applied by
+    /// `get_entity_relationships_limited`, which sorts by effective strength
+    /// DESCENDING and truncates — so what a cap discards is the WEAK tail. On
+    /// LoCoMo the maximum degree is 301 against a budget of 100, and hub edges
+    /// are born weak (the PMI birth weighting floors an incidental pair at
+    /// `GRAPH_PMI_WEIGHT_FLOOR`), which is exactly where a rare gold entity
+    /// hangs off a speaker hub.
+    #[test]
+    fn per_node_edge_budget_truncates_the_weak_tail() {
+        let (_dir, graph) = reach_fixture();
+        let hub = add_named_entity(&graph, "hubword");
+        let gold = add_named_entity(&graph, "goldword");
+        for i in 0..3 {
+            let filler = add_named_entity(&graph, &format!("filler{i}"));
+            add_directed_edge(&graph, hub, filler, 0.9);
+        }
+        // Weakest edge on the hub — above L2_PRUNE_THRESHOLD (0.2) so the
+        // opportunistic read-time prune leaves it alone, below every filler.
+        add_directed_edge(&graph, hub, gold, 0.35);
+
+        // Preconditions: the cap really is what removes the gold edge.
+        let all = graph
+            .get_entity_relationships_limited(&hub, Some(16))
+            .unwrap();
+        assert_eq!(all.len(), 4, "hub must carry all four edges");
+        let capped = graph
+            .get_entity_relationships_limited(&hub, Some(3))
+            .unwrap();
+        assert!(
+            !capped.iter().any(|e| e.to_entity == gold),
+            "a 3-edge budget must drop the weakest (gold) edge"
+        );
+
+        let mut seeds = HashMap::new();
+        seeds.insert(hub, 1.0_f32);
+
+        let tight = TraversalLimits {
+            dir_fix: false,
+            max_edges: 3,
+        };
+        let (under_cap, _, _) =
+            personalized_pagerank(&graph, &seeds, None, false, false, None, tight).unwrap();
+        assert!(
+            !under_cap.contains_key(&gold),
+            "gold hanging off the hub's weakest edge must be invisible under a \
+             budget that truncates it; activated={under_cap:?}"
+        );
+
+        let wide = TraversalLimits {
+            dir_fix: false,
+            max_edges: 4,
+        };
+        let (over_cap, _, _) =
+            personalized_pagerank(&graph, &seeds, None, false, false, None, wide).unwrap();
+        assert!(
+            over_cap.get(&gold).copied().unwrap_or(0.0) > 0.0,
+            "raising the budget by one edge must recover it; activated={over_cap:?}"
+        );
+    }
+
+    /// The budget also bounds the beam walk and the reachability injection, so
+    /// raising it has to move those too — otherwise an ablation arm would
+    /// silently measure only the PPR half of the leg.
+    #[test]
+    fn per_node_edge_budget_binds_beam_and_reachability_walks() {
+        let (_dir, graph) = reach_fixture();
+        let hub = add_named_entity(&graph, "hubword");
+        let gold = add_named_entity(&graph, "goldword");
+        for i in 0..3 {
+            let filler = add_named_entity(&graph, &format!("filler{i}"));
+            add_directed_edge(&graph, hub, filler, 0.9);
+        }
+        add_directed_edge(&graph, hub, gold, 0.35);
+
+        let mut seeds = HashMap::new();
+        seeds.insert(hub, 1.0_f32);
+
+        let tight = TraversalLimits {
+            dir_fix: false,
+            max_edges: 3,
+        };
+        let wide = TraversalLimits {
+            dir_fix: false,
+            max_edges: 4,
+        };
+
+        let beam_tight = traverse_beam(&graph, &seeds, None, false, tight).unwrap();
+        let beam_wide = traverse_beam(&graph, &seeds, None, false, wide).unwrap();
+        assert!(
+            !beam_tight.contains_key(&gold) && beam_wide.contains_key(&gold),
+            "beam traversal must honour the budget: tight={beam_tight:?} wide={beam_wide:?}"
+        );
+
+        let reach_tight = reachable_inject(&graph, &seeds, None, false, tight).unwrap();
+        let reach_wide = reachable_inject(&graph, &seeds, None, false, wide).unwrap();
+        assert!(
+            !reach_tight.contains_key(&gold) && reach_wide.contains_key(&gold),
+            "reachability injection must honour the budget: \
+             tight={reach_tight:?} wide={reach_wide:?}"
+        );
+    }
+
+    #[test]
+    fn traversal_limits_default_is_the_shipped_behaviour() {
+        let d = TraversalLimits::default();
+        assert!(
+            !d.dir_fix,
+            "the direction fix must stay OFF by default — flipping a retrieval \
+             default without measurement is not allowed"
+        );
+        assert_eq!(
+            d.max_edges, DEFAULT_GRAPH_MAX_EDGES,
+            "the default budget must equal the constant the code shipped with"
+        );
+        assert_eq!(DEFAULT_GRAPH_MAX_EDGES, 100);
+    }
+
+    /// Both flags must actually REACH the live graph leg.
+    ///
+    /// This is the `SHODH_SPREAD_FIX` lesson: that flag's branch sat behind the
+    /// default-on `SHODH_PPR` branch, so it could never execute, and its
+    /// ablation arms silently duplicated the baseline for months. Asserting on
+    /// the private walk functions would not have caught it. This test drives the
+    /// PUBLIC entry point — the one `memory/mod.rs` calls — with nothing but the
+    /// environment changed, and asserts the leg's own `entities_activated`
+    /// statistic moves.
+    #[test]
+    fn traversal_flags_reach_the_live_graph_leg() {
+        let _env_guard = TRAVERSAL_ENV_LOCK.lock();
+        std::env::remove_var("SHODH_GRAPH_EDGE_DIR");
+        std::env::remove_var("SHODH_GRAPH_MAX_EDGES");
+
+        struct StubEmbedder;
+        impl crate::embeddings::Embedder for StubEmbedder {
+            fn encode(&self, _text: &str) -> Result<Vec<f32>> {
+                Ok(vec![0.1, 0.2, 0.3, 0.4])
+            }
+            fn dimension(&self) -> usize {
+                4
+            }
+        }
+        let embedder = StubEmbedder;
+        let episode_to_memory = |_ep: &EpisodicNode| -> Result<Option<SharedMemory>> { Ok(None) };
+        let query = Query {
+            query_text: Some("widget".to_string()),
+            ..Query::default()
+        };
+
+        // --- SHODH_GRAPH_EDGE_DIR: the only edge into the seed points AT it ---
+        let (_dir_a, graph_a) = reach_fixture();
+        let widget = add_named_entity(&graph_a, "widget");
+        let gadget = add_named_entity(&graph_a, "gadget");
+        add_directed_edge(&graph_a, gadget, widget, 0.8);
+
+        let run_a = || {
+            spreading_activation_retrieve_with_stats(
+                "widget",
+                &query,
+                &graph_a,
+                &embedder,
+                None,
+                None,
+                None,
+                episode_to_memory,
+            )
+            .expect("graph leg must run")
+            .1
+            .entities_activated
+        };
+
+        let dir_off = run_a();
+        assert_eq!(
+            dir_off, 1,
+            "with the flag unset the live leg must stay on the seed alone \
+             (the incoming edge is a self-loop), got {dir_off}"
+        );
+        std::env::set_var("SHODH_GRAPH_EDGE_DIR", "1");
+        let dir_on = run_a();
+        std::env::remove_var("SHODH_GRAPH_EDGE_DIR");
+        assert_eq!(
+            dir_on, 2,
+            "SHODH_GRAPH_EDGE_DIR=1 must reach the LIVE leg and recover the \
+             incoming-edge neighbour, got {dir_on}"
+        );
+
+        // --- SHODH_GRAPH_MAX_EDGES: two outgoing edges, budget of one ---
+        let (_dir_b, graph_b) = reach_fixture();
+        let widget_b = add_named_entity(&graph_b, "widget");
+        let strong = add_named_entity(&graph_b, "gadget");
+        let weak = add_named_entity(&graph_b, "sprocket");
+        add_directed_edge(&graph_b, widget_b, strong, 0.9);
+        add_directed_edge(&graph_b, widget_b, weak, 0.35);
+
+        let run_b = || {
+            spreading_activation_retrieve_with_stats(
+                "widget",
+                &query,
+                &graph_b,
+                &embedder,
+                None,
+                None,
+                None,
+                episode_to_memory,
+            )
+            .expect("graph leg must run")
+            .1
+            .entities_activated
+        };
+
+        let budget_default = run_b();
+        assert_eq!(
+            budget_default, 3,
+            "unset budget (100) must admit both edges, got {budget_default}"
+        );
+        std::env::set_var("SHODH_GRAPH_MAX_EDGES", "1");
+        let budget_one = run_b();
+        std::env::remove_var("SHODH_GRAPH_MAX_EDGES");
+        assert_eq!(
+            budget_one, 2,
+            "SHODH_GRAPH_MAX_EDGES=1 must reach the LIVE leg and truncate the \
+             weak edge, got {budget_one}"
+        );
+
+        // An unparseable or zero budget must fall back to the shipped default
+        // rather than silently disabling traversal.
+        std::env::set_var("SHODH_GRAPH_MAX_EDGES", "0");
+        let zero = TraversalLimits::from_env();
+        std::env::set_var("SHODH_GRAPH_MAX_EDGES", "not-a-number");
+        let junk = TraversalLimits::from_env();
+        std::env::remove_var("SHODH_GRAPH_MAX_EDGES");
+        assert_eq!(zero.max_edges, DEFAULT_GRAPH_MAX_EDGES);
+        assert_eq!(junk.max_edges, DEFAULT_GRAPH_MAX_EDGES);
     }
 }

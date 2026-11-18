@@ -20,17 +20,18 @@ use crate::handlers::MultiUserMemoryManager;
 use crate::memory::retrieval::RetrievalOutcome;
 use crate::memory::types::MemoryId;
 use crate::memory::types::{ExperienceType, LayerMode, NerEntityRecord};
-use crate::memory::{Experience, Query};
+use crate::memory::{Experience, MemorySystem, Query};
 
 use super::fixtures::{
     self, CorpusItem, SmokeCase, SmokeCategory, SMOKE_CASES_PATH, SMOKE_CORPUS_PATH,
 };
-use super::metrics::Metrics;
+use super::metrics::{paired_bootstrap_ci, Metrics};
 use super::report::{
-    aggregate_category, aggregate_layer, median, AblationReport, AblationRow, CategoryReport,
-    Failure, FunnelReport, FunnelStageRow, GraphStructure, LayerReport, LearningCurveArm,
-    LearningCurveReport, LinkingReport, LinkingRow, PerCaseRecord, ReachabilityCategory,
-    ReachabilityReport, Report, SMOKE_K,
+    aggregate_category, aggregate_layer, median, AblationCaseRow, AblationReport, AblationRow,
+    CategoryReport, DeltaCi, Failure, FunnelReport, FunnelStageRow, GraphStructure, KernelClass,
+    LayerReport, LearningCurveArm, LearningCurveReport, LinkingReport, LinkingRow, PerCaseRecord,
+    ReachabilityCategory, ReachabilityReport, Report, RerankSetting, StageRow, StageTimingReport,
+    SMOKE_K,
 };
 
 /// Embedder identifier emitted in the report. Matches the model wired into
@@ -156,7 +157,7 @@ pub fn run_smoke_suite_with_ranks(inputs: &RunInputs) -> Result<ReportWithRanks>
     // so production callers (which never invoke the harness) stay
     // unaffected.
     // ------------------------------------------------------------------
-    pin_harness_threads();
+    let _harness_env = pin_harness_threads();
 
     let corpus_path = inputs
         .corpus_path
@@ -293,7 +294,10 @@ pub fn run_smoke_suite_with_ranks(inputs: &RunInputs) -> Result<ReportWithRanks>
     // RH-8: within each pass, ingest happens once and the case loop runs
     // once per `LayerMode`. Determinism check is per-mode.
     let mut passes: Vec<OnePassResult> = Vec::with_capacity(repeats);
+    // Model tape coverage: inputs the models were first asked for in each repeat.
+    let mut tape_growth: Vec<(usize, usize)> = Vec::new();
     for i in 0..repeats {
+        let tape_before = crate::embeddings::model_tape::entry_count();
         let pass_storage = if repeats == 1 {
             // Preserve the historical layout for single-repeat runs so
             // existing CI artifacts and the integration test stay valid.
@@ -307,10 +311,16 @@ pub fn run_smoke_suite_with_ranks(inputs: &RunInputs) -> Result<ReportWithRanks>
             &cases,
             &layer_modes,
             inputs.age_days,
+            _harness_env.recall_read_only(),
         )
         .with_context(|| format!("repeat {i} of {repeats}"))?;
         passes.push(pass);
+        let added = crate::embeddings::model_tape::entry_count() - tape_before;
+        if i > 0 && added > 0 {
+            tape_growth.push((i, added));
+        }
     }
+    let tape_failures = finish_model_tape(&corpus, &tape_growth, &inputs.git_sha);
 
     // ------------------------------------------------------------------
     // Determinism check across repeats. Two passes against the same
@@ -320,6 +330,7 @@ pub fn run_smoke_suite_with_ranks(inputs: &RunInputs) -> Result<ReportWithRanks>
     // `infrastructure` failure so reviewers see the full picture.
     // ------------------------------------------------------------------
     let mut failures: Vec<Failure> = passes[0].failures.clone();
+    failures.extend(tape_failures);
     if repeats > 1 {
         for mode in &layer_modes {
             let ref_pass = passes[0]
@@ -331,18 +342,48 @@ pub fn run_smoke_suite_with_ranks(inputs: &RunInputs) -> Result<ReportWithRanks>
                     .per_mode
                     .get(mode)
                     .expect("every repeat must have every mode");
+                let mut hidden_pool_divergence: Vec<String> = Vec::new();
                 for (k, ref_rank) in ref_pass.ranks.iter().enumerate() {
                     let cur_rank = &cur_pass.ranks[k];
                     debug_assert_eq!(ref_rank.case_id, cur_rank.case_id);
+                    let pool_note =
+                        pool_divergence_note(&ref_pass.rerank_pools[k], &cur_pass.rerank_pools[k]);
+                    let leg_note =
+                        leg_divergence_note(&ref_pass.leg_lists[k], &cur_pass.leg_lists[k]);
                     if ref_rank.retrieved != cur_rank.retrieved {
+                        let located = pool_note
+                            .as_deref()
+                            .map(|n| format!(" — {n}"))
+                            .unwrap_or_default()
+                            + &leg_note
+                                .as_deref()
+                                .map(|n| format!(" — {n}"))
+                                .unwrap_or_default();
                         failures.push(Failure {
                             kind: "infrastructure".to_string(),
                             detail: format!(
                                 "non-determinism [mode={}]: case {} rank list diverged between repeat 0 and repeat {i} \
-                                 — repeat 0 = {:?}, repeat {i} = {:?}",
+                                 — repeat 0 = {:?}, repeat {i} = {:?}{located}",
                                 mode.report_key(), ref_rank.case_id, ref_rank.retrieved, cur_rank.retrieved
                             ),
                         });
+                    } else if let Some(note) = pool_note.filter(|n| !n.starts_with(POOL_IDENTICAL))
+                    {
+                        let legs = leg_note.map(|n| format!(" — {n}")).unwrap_or_default();
+                        hidden_pool_divergence.push(format!("{}: {note}{legs}", ref_rank.case_id));
+                    }
+                }
+                // Not a gate failure, since the output agreed. But a pool that
+                // differs between two ingests of one corpus is non-determinism
+                // the top-k comparison cannot see, so the log records it.
+                if !hidden_pool_divergence.is_empty() {
+                    eprintln!(
+                        "rerank pool diverged with identical top-k [mode={}] repeat 0 vs {i}: {} case(s)",
+                        mode.report_key(),
+                        hidden_pool_divergence.len()
+                    );
+                    for line in &hidden_pool_divergence {
+                        eprintln!("  {line}");
                     }
                 }
             }
@@ -399,9 +440,21 @@ pub fn run_smoke_suite_with_ranks(inputs: &RunInputs) -> Result<ReportWithRanks>
         );
     }
 
+    // Per-stage breakdown for the gated mode (SHODH_STAGE_TIMING=1 only). Built
+    // from the same passes the headline aggregates use, so the `e2e_*` fields in
+    // it are the same numbers as `layers[highest].latency_*` by construction —
+    // which is what makes the reconciliation line meaningful.
+    let stage_timing_report = aggregate_stage_timing(highest_mode, &passes, cases.len(), repeats)
+        .inspect(|st| {
+            print_stage_timing(st);
+        });
+
     let report = Report {
         suite: inputs.suite.clone(),
         embedder: EMBEDDER_ID.to_string(),
+        kernel: KernelClass::detect(),
+        rerank: Some(RerankSetting::current()),
+        model_tape: crate::embeddings::model_tape::replay_digest(),
         git_sha: inputs.git_sha.clone(),
         timestamp: chrono::Utc::now(),
         layers,
@@ -409,6 +462,7 @@ pub fn run_smoke_suite_with_ranks(inputs: &RunInputs) -> Result<ReportWithRanks>
         case_count: cases.len(),
         repeats,
         failures,
+        stage_timing: stage_timing_report,
     };
 
     // Per-case diagnostics for every mode, from the same repeat-0 pass the
@@ -446,6 +500,116 @@ pub fn run_smoke_suite_with_ranks(inputs: &RunInputs) -> Result<ReportWithRanks>
         ranks,
         per_case_by_layer,
     })
+}
+
+/// Prefix of [`pool_divergence_note`]'s verdict when two pools agree.
+const POOL_IDENTICAL: &str = "rerank pool identical";
+
+/// Say where two repeats' rerank pools part ways, or that they did not.
+///
+/// `None` when reranking was off in either repeat (empty pools). Otherwise
+/// either "identical", which puts a rank divergence on the reranker's scores,
+/// or the first position the pools differ at and which candidates each had
+/// that the other did not, which puts it on the pipeline that built the pool.
+fn pool_divergence_note(a: &CaseRankList, b: &CaseRankList) -> Option<String> {
+    if a.retrieved.is_empty() || b.retrieved.is_empty() {
+        return None;
+    }
+    if a.retrieved == b.retrieved {
+        return Some(format!(
+            "{POOL_IDENTICAL} ({} candidates), so the divergence is in the reranker's scores",
+            a.retrieved.len()
+        ));
+    }
+    Some(format!(
+        "rerank pool diverged {}",
+        list_divergence(&a.retrieved, &b.retrieved)
+    ))
+}
+
+/// Where two ordered candidate lists part ways: the first differing position
+/// and the members each has that the other lacks.
+fn list_divergence(a: &[String], b: &[String]) -> String {
+    let first = a
+        .iter()
+        .zip(b)
+        .position(|(x, y)| x != y)
+        .unwrap_or_else(|| a.len().min(b.len()));
+    let set_a: HashSet<&String> = a.iter().collect();
+    let set_b: HashSet<&String> = b.iter().collect();
+    let mut only_a: Vec<&String> = set_a.difference(&set_b).copied().collect();
+    let mut only_b: Vec<&String> = set_b.difference(&set_a).copied().collect();
+    only_a.sort();
+    only_b.sort();
+    format!(
+        "at position {first} (repeat 0 has {:?}, the other {:?}); \
+         only in repeat 0: {only_a:?}, only in the other: {only_b:?}",
+        a.get(first),
+        b.get(first),
+    )
+}
+
+/// Name the first pipeline stage whose candidate list differs between two
+/// repeats of one query, or say that every captured stage agreed.
+///
+/// `None` when nothing was captured in either repeat. The stages are compared
+/// in the order the pipeline recorded them, so the first difference is the
+/// leg the divergence entered through; every stage after it inherits it. A
+/// stage whose ids agree but whose scores do not is reported as such, since a
+/// reordering of equal scores and a change in the scores have different
+/// causes.
+fn leg_divergence_note(
+    a: &[(String, Vec<(String, Option<f32>)>)],
+    b: &[(String, Vec<(String, Option<f32>)>)],
+) -> Option<String> {
+    if a.is_empty() || b.is_empty() {
+        return None;
+    }
+    let ids_of = |l: &[(String, Option<f32>)]| -> Vec<String> {
+        l.iter().map(|(id, _)| id.clone()).collect()
+    };
+    for (i, (x, y)) in a.iter().zip(b).enumerate() {
+        if x.0 != y.0 {
+            return Some(format!(
+                "stage sequence differs at index {i}: repeat 0 recorded {:?}, the other {:?}",
+                x.0, y.0
+            ));
+        }
+        let (xi, yi) = (ids_of(x.1.as_slice()), ids_of(y.1.as_slice()));
+        if xi != yi {
+            return Some(format!(
+                "first differing leg: {} ({} vs {} candidates) {}",
+                x.0,
+                xi.len(),
+                yi.len(),
+                list_divergence(&xi, &yi)
+            ));
+        }
+        let scores_differ =
+            x.1.iter()
+                .zip(&y.1)
+                .position(|((_, sx), (_, sy))| sx.map(f32::to_bits) != sy.map(f32::to_bits));
+        if let Some(p) = scores_differ {
+            return Some(format!(
+                "first differing leg: {} — same {} candidates in the same order, scores differ \
+                 from position {p}: {} scored {:?} in repeat 0 and {:?} in the other",
+                x.0,
+                xi.len(),
+                x.1[p].0,
+                x.1[p].1,
+                y.1[p].1
+            ));
+        }
+    }
+    if a.len() != b.len() {
+        return Some(format!(
+            "stage sequence lengths differ: repeat 0 recorded {} stages, the other {}",
+            a.len(),
+            b.len()
+        ));
+    }
+    let names: Vec<&str> = a.iter().map(|(n, _)| n.as_str()).collect();
+    Some(format!("every captured leg identical: {names:?}"))
 }
 
 /// Build per-case diagnostics from one mode's aligned outputs.
@@ -521,6 +685,237 @@ fn build_per_case_records(
         .collect()
 }
 
+/// Accessor table for the seven top-level stages, in pipeline order.
+///
+/// These PARTITION the instrumented portion of `recall()`: each nanosecond of
+/// `recall_inner` falls in exactly one of them, so their means sum to
+/// `stage_sum_mean_ms` and the shortfall against the wall clock is the
+/// `unattributed` line.
+type StageGetter = (
+    &'static str,
+    fn(&crate::stage_probe::Probe) -> std::time::Duration,
+);
+
+const TOP_STAGES: [StageGetter; 7] = [
+    ("query_analysis", |p| p.query_analysis),
+    ("embedding", |p| p.embedding),
+    ("graph_expansion", |p| p.graph_expansion),
+    ("vector_search", |p| p.vector_search),
+    ("fusion", |p| p.fusion),
+    ("scoring", |p| p.scoring),
+    ("post", |p| p.post),
+];
+
+/// Sub-stages carved out of the rows above. These OVERLAP the top-level stages
+/// and must never be summed with them.
+const SUB_STAGES: [StageGetter; 6] = [
+    ("tokenize", |p| p.tokenize),
+    ("onnx_forward", |p| p.onnx_forward),
+    ("bm25", |p| p.bm25),
+    ("fetch", |p| p.fetch),
+    ("storage_read", |p| p.storage_read),
+    ("storage_decode", |p| p.storage_decode),
+];
+
+/// Which region each sub-stage is contained in, for the stderr table.
+///
+/// `storage_read`/`storage_decode` are labelled `recall` rather than `fetch`
+/// deliberately: `MemoryStorage::get` is called from the graph traversal as well
+/// as the Layer-5 cascade, and measurement showed ~675 calls per query against
+/// ~0.1ms of Layer-5 cold fetch — i.e. nearly all of that cost is paid inside
+/// `graph_expansion`. Labelling them as subsets of `fetch` would have implied
+/// the opposite.
+const SUB_STAGE_PARENT: [(&str, &str); 6] = [
+    ("tokenize", "embedding"),
+    ("onnx_forward", "embedding"),
+    ("bm25", "fusion"),
+    ("fetch", "scoring"),
+    ("storage_read", "recall"),
+    ("storage_decode", "recall"),
+];
+
+/// Build one `StageRow` from per-case medians (already median-across-repeats).
+fn stage_row(name: &str, per_case_ms: &[f64], e2e_mean_ms: f64) -> StageRow {
+    let (p50, p95, p99) = crate::recall_harness::report::latency_percentiles(per_case_ms);
+    let mean = if per_case_ms.is_empty() {
+        0.0
+    } else {
+        per_case_ms.iter().sum::<f64>() / per_case_ms.len() as f64
+    };
+    StageRow {
+        stage: name.to_string(),
+        p50_ms: p50,
+        p95_ms: p95,
+        p99_ms: p99,
+        mean_ms: mean,
+        mean_share_pct: if e2e_mean_ms > 0.0 {
+            100.0 * mean / e2e_mean_ms
+        } else {
+            0.0
+        },
+    }
+}
+
+/// Aggregate the per-case stage probes into a `StageTimingReport`.
+///
+/// Measurement discipline is identical to the headline latency: for each case
+/// take the MEDIAN across repeats, then take percentiles across cases. Doing it
+/// the other way (percentile within a repeat, then average) would let one noisy
+/// repeat move a stage's p95, which is exactly the failure mode that made an
+/// earlier 113ms embed reading look real when it was build contention.
+///
+/// Returns `None` when no probes were collected (flag off, or the mode was never
+/// run), so an absent breakdown is never confused with an all-zero one.
+fn aggregate_stage_timing(
+    mode: LayerMode,
+    passes: &[OnePassResult],
+    case_count: usize,
+    repeats: usize,
+) -> Option<StageTimingReport> {
+    let per_mode: Vec<&ModePassResult> = passes
+        .iter()
+        .filter_map(|p| p.per_mode.get(&mode))
+        .collect();
+    if per_mode.is_empty() || per_mode.iter().any(|m| m.stage_probes.len() != case_count) {
+        return None;
+    }
+
+    // Per-case median across repeats, for the wall clock and for every stage.
+    let median_across_repeats = |f: &dyn Fn(&ModePassResult, usize) -> f64| -> Vec<f64> {
+        (0..case_count)
+            .map(|k| {
+                let samples: Vec<f64> = per_mode.iter().map(|m| f(m, k)).collect();
+                median(&samples)
+            })
+            .collect()
+    };
+
+    let e2e: Vec<f64> = median_across_repeats(&|m, k| m.latencies_ms[k]);
+    let e2e_mean = if e2e.is_empty() {
+        0.0
+    } else {
+        e2e.iter().sum::<f64>() / e2e.len() as f64
+    };
+    let (e2e_p50, e2e_p95, _) = crate::recall_harness::report::latency_percentiles(&e2e);
+
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+
+    let stages: Vec<StageRow> = TOP_STAGES
+        .iter()
+        .map(|(name, get)| {
+            let per_case = median_across_repeats(&|m, k| ms(get(&m.stage_probes[k])));
+            stage_row(name, &per_case, e2e_mean)
+        })
+        .collect();
+    let substages: Vec<StageRow> = SUB_STAGES
+        .iter()
+        .map(|(name, get)| {
+            let per_case = median_across_repeats(&|m, k| ms(get(&m.stage_probes[k])));
+            stage_row(name, &per_case, e2e_mean)
+        })
+        .collect();
+
+    let stage_sum = median_across_repeats(&|m, k| ms(m.stage_probes[k].stage_sum()));
+    let stage_sum_mean = if stage_sum.is_empty() {
+        0.0
+    } else {
+        stage_sum.iter().sum::<f64>() / stage_sum.len() as f64
+    };
+
+    let mean_count = |f: &dyn Fn(&crate::stage_probe::Probe) -> u32| -> f64 {
+        let v = median_across_repeats(&|m, k| f(&m.stage_probes[k]) as f64);
+        if v.is_empty() {
+            0.0
+        } else {
+            v.iter().sum::<f64>() / v.len() as f64
+        }
+    };
+
+    Some(StageTimingReport {
+        mode: mode.report_key().to_string(),
+        case_count,
+        repeats,
+        e2e_p50_ms: e2e_p50,
+        e2e_p95_ms: e2e_p95,
+        e2e_mean_ms: e2e_mean,
+        stage_sum_mean_ms: stage_sum_mean,
+        unattributed_mean_ms: e2e_mean - stage_sum_mean,
+        stages,
+        substages,
+        mean_forwards: mean_count(&|p| p.forwards),
+        mean_inner_recalls: mean_count(&|p| p.inner_recalls),
+        mean_storage_reads: mean_count(&|p| p.storage_reads),
+    })
+}
+
+/// Print the stage breakdown to stderr, greppable as `STAGE_TIMING`.
+///
+/// The JSON report is the machine artifact; this is the one a human reads in a
+/// CI log without piping through `jq`.
+fn print_stage_timing(st: &StageTimingReport) {
+    eprintln!(
+        "STAGE_TIMING mode={} cases={} repeats={} e2e_p50={:.2}ms e2e_p95={:.2}ms e2e_mean={:.2}ms",
+        st.mode, st.case_count, st.repeats, st.e2e_p50_ms, st.e2e_p95_ms, st.e2e_mean_ms
+    );
+    eprintln!(
+        "STAGE_TIMING {:<18} {:>9} {:>9} {:>9} {:>9} {:>8}",
+        "stage", "p50_ms", "p95_ms", "p99_ms", "mean_ms", "share%"
+    );
+    let row = |prefix: &str, r: &StageRow| {
+        eprintln!(
+            "STAGE_TIMING {:<18} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {:>7.1}%",
+            format!("{prefix}{}", r.stage),
+            r.p50_ms,
+            r.p95_ms,
+            r.p99_ms,
+            r.mean_ms,
+            r.mean_share_pct
+        );
+    };
+    for r in &st.stages {
+        row("", r);
+    }
+    eprintln!(
+        "STAGE_TIMING {:<18} {:>9} {:>9} {:>9} {:>9.2} {:>7.1}%",
+        "= stage sum",
+        "",
+        "",
+        "",
+        st.stage_sum_mean_ms,
+        if st.e2e_mean_ms > 0.0 {
+            100.0 * st.stage_sum_mean_ms / st.e2e_mean_ms
+        } else {
+            0.0
+        }
+    );
+    eprintln!(
+        "STAGE_TIMING {:<18} {:>9} {:>9} {:>9} {:>9.2} {:>7.1}%",
+        "+ unattributed",
+        "",
+        "",
+        "",
+        st.unattributed_mean_ms,
+        if st.e2e_mean_ms > 0.0 {
+            100.0 * st.unattributed_mean_ms / st.e2e_mean_ms
+        } else {
+            0.0
+        }
+    );
+    eprintln!("STAGE_TIMING -- sub-stages (subsets of the rows above; do NOT sum) --");
+    for r in &st.substages {
+        let parent = SUB_STAGE_PARENT
+            .iter()
+            .find(|(n, _)| *n == r.stage)
+            .map(|(_, p)| *p)
+            .unwrap_or("?");
+        row(&format!("{parent}/"), r);
+    }
+    eprintln!(
+        "STAGE_TIMING counts: onnx_forwards/query={:.2} inner_recalls/query={:.2} cold_rocksdb_reads/query={:.2}",
+        st.mean_forwards, st.mean_inner_recalls, st.mean_storage_reads
+    );
+}
+
 /// Per-case results for one `LayerMode` within a single ingest+query pass.
 struct ModePassResult {
     per_case: Vec<Metrics>,
@@ -534,6 +929,22 @@ struct ModePassResult {
     /// diagnostic is off this is a copy of `ranks`. Diagnostic side channel
     /// only — never folded into gated aggregates or the determinism check.
     deep_ranks: Vec<CaseRankList>,
+    /// The candidate pool the cross-encoder rescored for each case, aligned
+    /// with `ranks`; empty lists when reranking is off. Fetched by a separate
+    /// read-only query after the timed one, so it perturbs neither latency nor
+    /// state. Diagnostic only: it locates a repeat divergence (a different pool
+    /// vs different scores over the same pool) and is never gated on.
+    rerank_pools: Vec<CaseRankList>,
+    /// For each case, the ordered candidate list every pipeline stage
+    /// recorded while the pool query ran (graph, vector, bm25, hybrid,
+    /// fusion, ...), in pipeline order, as corpus ids with the stage's score
+    /// where it has one. Empty when reranking is off. Lets a divergence be
+    /// placed on the first leg it appears in, not the last, and told apart as
+    /// a reordering or a change of scores.
+    leg_lists: Vec<Vec<(String, Vec<(String, Option<f32>)>)>>,
+    /// Per-case stage breakdown, aligned with `latencies_ms` by index. Empty
+    /// unless `SHODH_STAGE_TIMING=1`. Diagnostic only — never gated on.
+    stage_probes: Vec<crate::stage_probe::Probe>,
 }
 
 /// Output of one ingest pass plus N mode-keyed query passes over the
@@ -560,40 +971,15 @@ fn run_one_pass(
     cases: &[SmokeCase],
     layer_modes: &[LayerMode],
     age_days: f64,
+    read_only: bool,
 ) -> Result<OnePassResult> {
     // Ingest through the production manager so the graph/lineage/ontology layer
     // is actually built, then query the per-user `MemorySystem` (which now has a
     // populated graph wired in). The manager is kept alive for the whole pass.
     let manager = build_manager(storage_path)?;
 
-    // NER-backend gate (eval fidelity): every CI number before 2026-06-11 was
-    // silently measured on the rule-based fallback NER (census-shape proof,
-    // run 27342411453). Refuse to measure on it again — a harness that tests a
-    // different recognizer than production ships is not measuring the system.
-    // SHODH_ALLOW_FALLBACK_NER=1 is the explicit, visible escape hatch.
-    let ner_backend = if manager.get_neural_ner().is_fallback_mode() {
-        "fallback"
-    } else {
-        "neural"
-    };
-    eprintln!("NER_BACKEND={ner_backend}");
-    // cfg!(test) exemption: lib tests exercise the harness MACHINERY on
-    // runners that may lack the model; the gate protects MEASUREMENTS (the
-    // recall-eval binary is never cfg(test)).
-    if ner_backend == "fallback"
-        && !cfg!(test)
-        && !std::env::var("SHODH_ALLOW_FALLBACK_NER")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-    {
-        anyhow::bail!(
-            "recall harness refusing to run on the FALLBACK NER (model not \
-             loaded) — results would not measure the shipped system. Provide \
-             the pinned model or set SHODH_ALLOW_FALLBACK_NER=1 to override \
-             visibly."
-        );
-    }
-
+    // The NER-backend gate now lives in `ingest_corpus`, so every measurement
+    // path is covered rather than only the two that remembered to ask.
     let id_map = ingest_corpus(&manager, corpus)?;
     let system = manager.get_user_memory(EVAL_USER)?;
 
@@ -621,6 +1007,32 @@ fn run_one_pass(
                 );
             }
         }
+    }
+
+    // Stage fingerprints (`SHODH_STAGE_EXPORT=<jsonl path>`, Full mode only).
+    //
+    // The repeat determinism check compares stages between passes of ONE
+    // process. This writes the same stages, plus the ingest-side ones it cannot
+    // see (embedding bytes, NER spans, the graph's node and edge sets), so two
+    // processes can be diffed stage by stage: two machines, two commits, or two
+    // settings. It is how the cross-runner divergence was located (#566):
+    // embeddings and NER scores drift by CPU kernel class while the graph's
+    // membership does not. Every per-case record also carries the reranker's
+    // scores over its pool, which is the data a depth router trains on.
+    // Scores travel as f32 bit patterns, so a one-ULP move shows as a move.
+    // Off unless the variable is set.
+    let stage_export: Option<PathBuf> = std::env::var("SHODH_STAGE_EXPORT")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    let mut stage_lines: Vec<String> = Vec::new();
+    if stage_export.is_some() {
+        stage_lines.extend(ingest_fingerprints(
+            &manager,
+            &system.read(),
+            corpus,
+            &id_map,
+        )?);
     }
 
     // SHODH_VAMANA_QUALITY_REBUILD=1 — A/B lever: bulk alpha-RNG rebuild at the
@@ -691,18 +1103,58 @@ fn run_one_pass(
         .map(std::path::PathBuf::from);
     let mut feature_lines: Vec<String> = Vec::new();
 
+    // Per-stage latency attribution (default off). When off, the case loop below
+    // calls `recall()` exactly as before and nothing downstream of this flag runs.
+    let stage_timing = std::env::var("SHODH_STAGE_TIMING")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    // Candidate-pool export (`SHODH_POOL_EXPORT=<jsonl path>`, Full mode only).
+    //
+    // Writes, per case: the query, the gold ids, and the RECALL_DIAG_K-deep
+    // candidate pool in rank order. That is everything an OFFLINE rescoring
+    // experiment needs -- a cross-encoder, a late-interaction MaxSim scorer, a
+    // fine-tuned or JEPA-style adapter -- because the pool is exactly the set a
+    // reranker would see and the gold ids are the labels. Candidate TEXT is
+    // deliberately not duplicated here: the corpus jsonl already holds it keyed
+    // by id, so the consumer joins rather than the harness bloating every line.
+    //
+    // The point is to convert "would X improve ranking?" from a 45-minute CI run
+    // into a script. ~32pp of gold sits in ranks 11-100, so every rescoring idea
+    // is testable against this file without touching the Rust pipeline at all.
+    let pool_export: Option<std::path::PathBuf> = std::env::var("SHODH_POOL_EXPORT")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from);
+    let mut pool_lines: Vec<String> = Vec::new();
+
     for mode in layer_modes {
         let mut per_case = Vec::with_capacity(cases.len());
         let mut latencies_ms = Vec::with_capacity(cases.len());
+        let mut stage_probes: Vec<crate::stage_probe::Probe> = Vec::new();
         let mut by_category_cases: HashMap<SmokeCategory, Vec<Metrics>> = HashMap::new();
         let mut ranks: Vec<CaseRankList> = Vec::with_capacity(cases.len());
         let mut deep_ranks: Vec<CaseRankList> = Vec::with_capacity(cases.len());
+        let mut rerank_pools: Vec<CaseRankList> = Vec::with_capacity(cases.len());
+        let mut leg_lists: Vec<Vec<(String, Vec<(String, Option<f32>)>)>> =
+            Vec::with_capacity(cases.len());
+
+        // TIMED PASS. One production recall per case and nothing else between
+        // two of them. Every diagnostic query (the RECALL_DIAG_K-deep list,
+        // the rerank pool, the per-leg capture) runs in the SECOND pass below,
+        // after the last timed recall, so whatever a diagnostic leaves behind
+        // -- warmed or evicted caches, allocator state, a hotter CPU -- is
+        // never in front of a measured recall. The gated latency is then a
+        // property of the production path alone, whichever diagnostics ride
+        // along in a given run.
+        let mut timed: Vec<(Query, HashMap<Uuid, f32>)> = Vec::with_capacity(cases.len());
 
         for case in cases {
             let mut query = Query {
                 query_text: Some(case.query.clone()),
                 max_results: SMOKE_K,
                 layers: *mode,
+                read_only,
                 ..Default::default()
             };
             // SHODH_QUERY_NER A/B lever: neural-NER graph seeding (no-op when unset).
@@ -720,10 +1172,27 @@ fn run_one_pass(
                 );
             }
 
+            // SHODH_STAGE_TIMING=1 swaps in `recall_with_timing`, which runs the
+            // SAME production `recall()` with the thread-local stage probe armed
+            // and hands back what it accumulated. The wall clock stays exactly
+            // where it was — around the recall call and nothing else — so the
+            // instrumented and uninstrumented end-to-end numbers are directly
+            // comparable. That comparison is the perturbation check; run the
+            // suite both ways and require agreement.
             let started = Instant::now();
-            let result = system.read().recall(&query);
+            let (result, probe) = if stage_timing {
+                match system.read().recall_with_timing(&query) {
+                    Ok((memories, probe)) => (Ok(memories), probe),
+                    Err(e) => (Err(e), crate::stage_probe::Probe::default()),
+                }
+            } else {
+                (system.read().recall(&query), Default::default())
+            };
             let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
             latencies_ms.push(elapsed_ms);
+            if stage_timing {
+                stage_probes.push(probe);
+            }
 
             let memories = match result {
                 Ok(m) => m,
@@ -774,60 +1243,6 @@ fn run_one_pass(
                 );
             }
 
-            // Depth diagnostics: a second, production-shaped recall at
-            // `max_results = diag_k` feeds ONLY the per-case recall@50/@100
-            // fields (see the diag_k comment above for why it must not be the
-            // same query). The two lists are different operating points by
-            // construction — the deeper vector pool admits new competitors, so
-            // a gold item's deep rank can even sit below its production rank;
-            // that is inherent to fetching a deeper list, not an
-            // inconsistency. The deep query is side-effect-free because the
-            // harness pins SHODH_RECALL_READONLY=1 (pin_harness_threads), so
-            // it cannot contaminate Hebbian/access state between cases.
-            let deep_retrieved: Vec<String> = if diag_k > SMOKE_K {
-                let mut deep_query = Query {
-                    query_text: Some(case.query.clone()),
-                    max_results: diag_k,
-                    layers: *mode,
-                    ..Default::default()
-                };
-                manager.annotate_query_ner(&mut deep_query);
-                match system.read().recall(&deep_query) {
-                    Ok(deep) => deep
-                        .iter()
-                        .map(|m| {
-                            uuid_to_corpus_id
-                                .get(&m.id.0)
-                                .cloned()
-                                .unwrap_or_else(|| format!("<unknown:{}>", m.id.0))
-                        })
-                        .collect(),
-                    Err(e) => {
-                        failures.push(Failure {
-                            kind: "case".to_string(),
-                            detail: format!(
-                                "diagnostic deep recall (RECALL_DIAG_K={diag_k}) failed for {} [mode={}]: {e:#}",
-                                case.id,
-                                mode.report_key()
-                            ),
-                        });
-                        Vec::new()
-                    }
-                }
-            } else {
-                // Diagnostic off: the depth fields degrade to the production
-                // list, exactly as before the two-query split.
-                ranks
-                    .last()
-                    .expect("production rank list was pushed above")
-                    .retrieved
-                    .clone()
-            };
-            deep_ranks.push(CaseRankList {
-                case_id: case.id.clone(),
-                retrieved: deep_retrieved,
-            });
-
             // Only emit the "missing relevance map" failure once across modes
             // — the relevance map is a function of fixtures + ingest, not
             // the mode, so duplicating it would clutter the failure list.
@@ -847,6 +1262,175 @@ fn run_one_pass(
                 .or_default()
                 .push(metrics);
             per_case.push(metrics);
+            timed.push((query, relevance));
+        }
+
+        // DIAGNOSTIC PASS. Same cases, same order, same read-only queries; the
+        // timed numbers above are already recorded. Every list this pass
+        // produces is aligned with `ranks` by index.
+        let corpus_id = |u: &Uuid| -> String {
+            uuid_to_corpus_id
+                .get(u)
+                .cloned()
+                .unwrap_or_else(|| format!("<unknown:{u}>"))
+        };
+        for (i, (case, (query, relevance))) in cases.iter().zip(&timed).enumerate() {
+            // Depth diagnostics: a second, production-shaped recall at
+            // `max_results = diag_k` feeds ONLY the per-case recall@50/@100
+            // fields (see the diag_k comment above for why it must not be the
+            // same query). The two lists are different operating points by
+            // construction — the deeper vector pool admits new competitors, so
+            // a gold item's deep rank can even sit below its production rank;
+            // that is inherent to fetching a deeper list, not an
+            // inconsistency. The deep query carries the same `read_only` the
+            // pass was started with, so it cannot contaminate Hebbian/access
+            // state between cases.
+            let deep_retrieved: Vec<String> = if diag_k > SMOKE_K {
+                let mut deep_query = Query {
+                    query_text: Some(case.query.clone()),
+                    max_results: diag_k,
+                    layers: *mode,
+                    read_only,
+                    ..Default::default()
+                };
+                manager.annotate_query_ner(&mut deep_query);
+                match system.read().recall(&deep_query) {
+                    Ok(deep) => deep.iter().map(|m| corpus_id(&m.id.0)).collect(),
+                    Err(e) => {
+                        failures.push(Failure {
+                            kind: "case".to_string(),
+                            detail: format!(
+                                "diagnostic deep recall (RECALL_DIAG_K={diag_k}) failed for {} [mode={}]: {e:#}",
+                                case.id,
+                                mode.report_key()
+                            ),
+                        });
+                        Vec::new()
+                    }
+                }
+            } else {
+                // Diagnostic off: the depth fields degrade to the production
+                // list, exactly as before the two-query split.
+                ranks[i].retrieved.clone()
+            };
+            if pool_export.is_some() && matches!(*mode, LayerMode::Full) {
+                // Corpus ids, matching `pool` -- `relevance` is keyed by Uuid while
+                // the rank lists are already corpus ids, so exporting the raw Uuid
+                // made the two sets disjoint and every offline join scored zero.
+                let mut gold: Vec<String> = relevance
+                    .keys()
+                    .map(|u| {
+                        uuid_to_corpus_id
+                            .get(u)
+                            .cloned()
+                            .unwrap_or_else(|| u.to_string())
+                    })
+                    .collect();
+                gold.sort();
+                pool_lines.push(
+                    serde_json::json!({
+                        "case_id": case.id,
+                        "category": category_name(case.category),
+                        "query": case.query,
+                        "gold": gold,
+                        "pool": deep_retrieved,
+                    })
+                    .to_string(),
+                );
+            }
+            deep_ranks.push(CaseRankList {
+                case_id: case.id.clone(),
+                retrieved: deep_retrieved,
+            });
+
+            // The funnel captures every stage's ordered candidates for this
+            // one query on this thread; `take_capture` disarms it before the
+            // next query, which therefore records nothing.
+            crate::memory::gold_funnel::begin_capture();
+            let pool_result = system.read().rerank_input_pool(query);
+            let legs: Vec<(String, Vec<(String, Option<f32>)>)> =
+                crate::memory::gold_funnel::take_capture()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(stage, entries)| {
+                        (
+                            stage,
+                            entries
+                                .iter()
+                                .map(|(id, score)| (corpus_id(&id.0), *score))
+                                .collect(),
+                        )
+                    })
+                    .collect();
+            leg_lists.push(legs);
+            let pool: Vec<String> = match pool_result {
+                Ok(Some(pool)) => pool.iter().map(|m| corpus_id(&m.id.0)).collect(),
+                Ok(None) => Vec::new(),
+                Err(e) => {
+                    failures.push(Failure {
+                        kind: "case".to_string(),
+                        detail: format!(
+                            "rerank pool diagnostic failed for {} [mode={}]: {e:#}",
+                            case.id,
+                            mode.report_key()
+                        ),
+                    });
+                    Vec::new()
+                }
+            };
+            rerank_pools.push(CaseRankList {
+                case_id: case.id.clone(),
+                retrieved: pool,
+            });
+
+            if stage_export.is_some() && matches!(*mode, LayerMode::Full) {
+                // One more production-shaped recall with the funnel armed, so
+                // the reranker's own scores (`ce` stage) sit beside the pool
+                // stages captured above. Scores travel as f32 bit patterns:
+                // a diff must show a one-ULP move as a move.
+                crate::memory::gold_funnel::begin_capture();
+                let final_ids: Vec<String> = match system.read().recall(query) {
+                    Ok(m) => m.iter().map(|m| corpus_id(&m.id.0)).collect(),
+                    Err(_) => Vec::new(),
+                };
+                let ce_stages = crate::memory::gold_funnel::take_capture().unwrap_or_default();
+                let bits = |entries: &[(String, Option<f32>)]| -> Vec<(String, Option<String>)> {
+                    entries
+                        .iter()
+                        .map(|(id, s)| (id.clone(), s.map(|v| format!("{:08x}", v.to_bits()))))
+                        .collect()
+                };
+                let legs_json: Vec<serde_json::Value> = leg_lists[i]
+                    .iter()
+                    .map(|(stage, entries)| {
+                        serde_json::json!({ "stage": stage, "items": bits(entries) })
+                    })
+                    .collect();
+                let ce_json: Vec<serde_json::Value> = ce_stages
+                    .iter()
+                    .filter(|(stage, _)| stage == "ce")
+                    .map(|(stage, entries)| {
+                        let entries: Vec<(String, Option<f32>)> = entries
+                            .iter()
+                            .map(|(id, s)| (corpus_id(&id.0), *s))
+                            .collect();
+                        serde_json::json!({ "stage": stage, "items": bits(&entries) })
+                    })
+                    .collect();
+                stage_lines.push(
+                    serde_json::json!({
+                        "kind": "case",
+                        "case_id": case.id,
+                        "ranks": ranks[i].retrieved,
+                        "final_captured": final_ids,
+                        "deep": deep_ranks[i].retrieved,
+                        "pool": rerank_pools[i].retrieved,
+                        "legs": legs_json,
+                        "ce": ce_json,
+                    })
+                    .to_string(),
+                );
+            }
         }
 
         per_mode.insert(
@@ -857,8 +1441,47 @@ fn run_one_pass(
                 latencies_ms,
                 ranks,
                 deep_ranks,
+                rerank_pools,
+                leg_lists,
+                stage_probes,
             },
         );
+    }
+
+    if let Some(path) = &pool_export {
+        if !pool_lines.is_empty() {
+            use std::io::Write as _;
+            let mut f = std::fs::File::create(path)
+                .with_context(|| format!("creating pool export {}", path.display()))?;
+            for line in &pool_lines {
+                writeln!(f, "{line}")?;
+            }
+            eprintln!(
+                "  pool export: {} cases -> {}",
+                pool_lines.len(),
+                path.display()
+            );
+        }
+    }
+
+    if let Some(path) = &stage_export {
+        if !stage_lines.is_empty() {
+            use std::io::Write as _;
+            // Truncate, as the pool export does: every repeat runs this pass, and
+            // appending would write each case once per repeat with nothing to tell
+            // them apart. The repeat gate requires the passes to agree, so the last
+            // pass's records stand for the run.
+            let mut f = std::fs::File::create(path)
+                .with_context(|| format!("creating stage export {}", path.display()))?;
+            for line in &stage_lines {
+                writeln!(f, "{line}")?;
+            }
+            eprintln!(
+                "  stage export: {} records -> {}",
+                stage_lines.len(),
+                path.display()
+            );
+        }
     }
 
     if let Some(path) = &feature_export {
@@ -878,6 +1501,240 @@ fn run_one_pass(
     Ok(OnePassResult { per_mode, failures })
 }
 
+/// Ingest-side fingerprints for `SHODH_STAGE_EXPORT`: one record per corpus
+/// item (stored embedding bytes, NER spans with score bits) and one for the
+/// graph (node and edge sets, keyed by entity NAME because uuids are minted
+/// per process). Every value is hashed over its raw little-endian bytes and
+/// accompanied by the leading bit patterns, so a diff between two machines
+/// shows both whether and by how much a stage moved.
+fn ingest_fingerprints(
+    manager: &MultiUserMemoryManager,
+    system: &MemorySystem,
+    corpus: &[CorpusItem],
+    id_map: &HashMap<String, Uuid>,
+) -> Result<Vec<String>> {
+    use sha2::{Digest, Sha256};
+    let bits = |values: &[f32], n: usize| -> Vec<String> {
+        values
+            .iter()
+            .take(n)
+            .map(|v| format!("{:08x}", v.to_bits()))
+            .collect()
+    };
+    let sha_f32 = |values: &[f32]| -> String {
+        let mut h = Sha256::new();
+        for v in values {
+            h.update(v.to_le_bytes());
+        }
+        hex::encode(h.finalize())
+    };
+    let ner = manager.get_neural_ner();
+    let mut lines = Vec::with_capacity(corpus.len() + 1);
+    let mut all_embeddings = Sha256::new();
+    let mut all_ner = Sha256::new();
+    for item in corpus {
+        let Some(uuid) = id_map.get(&item.id) else {
+            continue;
+        };
+        let embedding = system
+            .get_memory(&MemoryId(*uuid))
+            .with_context(|| format!("stage export: reading memory {}", item.id))?
+            .experience
+            .embeddings
+            .unwrap_or_default();
+        for v in &embedding {
+            all_embeddings.update(v.to_le_bytes());
+        }
+        // The same call ingest_corpus made for this item; the session is
+        // deterministic within a process (the repeat gate proves it), so this
+        // is the span set the graph was built from.
+        let spans: Vec<String> = ner
+            .extract(&item.content)
+            .unwrap_or_default()
+            .iter()
+            .map(|e| {
+                format!(
+                    "{}|{}|{:?}|{:08x}|{}|{}",
+                    e.text,
+                    e.entity_type.as_str(),
+                    e.fine_label,
+                    e.confidence.to_bits(),
+                    e.start,
+                    e.end
+                )
+            })
+            .collect();
+        let ner_line = spans.join(";");
+        all_ner.update(ner_line.as_bytes());
+        lines.push(
+            serde_json::json!({
+                "kind": "ingest",
+                "id": item.id,
+                "embedding_dim": embedding.len(),
+                "embedding_sha256": sha_f32(&embedding),
+                "embedding_head": bits(&embedding, 4),
+                "ner_sha256": hex::encode(Sha256::digest(ner_line.as_bytes())),
+                "ner": spans,
+            })
+            .to_string(),
+        );
+    }
+
+    let graph = manager.get_user_graph(EVAL_USER)?;
+    let graph = graph.read();
+    let entities = graph.get_all_entities()?;
+    let names: HashMap<Uuid, String> = entities.iter().map(|e| (e.uuid, e.name.clone())).collect();
+    let mut nodes: Vec<String> = entities
+        .iter()
+        .map(|e| format!("{}|{:?}|{}", e.name, e.labels, e.mention_count))
+        .collect();
+    nodes.sort();
+    let mut edges: Vec<String> = graph
+        .get_all_relationships()?
+        .iter()
+        .map(|r| {
+            format!(
+                "{}|{}|{}|{:08x}",
+                names
+                    .get(&r.from_entity)
+                    .cloned()
+                    .unwrap_or_else(|| r.from_entity.to_string()),
+                names
+                    .get(&r.to_entity)
+                    .cloned()
+                    .unwrap_or_else(|| r.to_entity.to_string()),
+                r.relation_type.as_str(),
+                r.strength.to_bits()
+            )
+        })
+        .collect();
+    edges.sort();
+    lines.push(
+        serde_json::json!({
+            "kind": "graph",
+            "embeddings_sha256": hex::encode(all_embeddings.finalize()),
+            "ner_sha256": hex::encode(all_ner.finalize()),
+            "node_count": nodes.len(),
+            "nodes_sha256": hex::encode(Sha256::digest(nodes.join("\n").as_bytes())),
+            "edge_count": edges.len(),
+            "edges_sha256": hex::encode(Sha256::digest(edges.join("\n").as_bytes())),
+            "nodes": nodes,
+            "edges": edges,
+        })
+        .to_string(),
+    );
+    Ok(lines)
+}
+
+/// Close out a model tape at the end of a suite run, returning what must fail the run.
+///
+/// Recording: every (query, corpus item) cross-encoder pair the run did not score is
+/// scored now, so a later change to retrieval that puts a different candidate in the
+/// pool still finds it on the tape; then the tape is written. Replaying: every model's
+/// files must have been checked against the tape header. Either way, any miss,
+/// mismatch or failed model call becomes an `infrastructure` failure, because the
+/// numbers did not come from the tape they claim to. `growth` lists the repeats after
+/// the first that asked the models for new inputs.
+fn finish_model_tape(
+    corpus: &[CorpusItem],
+    growth: &[(usize, usize)],
+    git_sha: &str,
+) -> Vec<Failure> {
+    use crate::embeddings::model_tape as tape;
+    let mut failures = Vec::new();
+    if !tape::active() {
+        return failures;
+    }
+    let infra = |detail: String| Failure {
+        kind: "infrastructure".to_string(),
+        detail: format!("model tape: {detail}"),
+    };
+    for (repeat, added) in growth {
+        failures.push(infra(format!(
+            "repeat {repeat} asked the models for {added} inputs that no earlier repeat              did, so what a run asks for is not stable and one recording cannot cover it"
+        )));
+    }
+    if tape::recording() {
+        match fill_cross_encoder_table(corpus) {
+            Ok(n) => eprintln!("  model tape: scored {n} cross-encoder pairs the run did not"),
+            Err(e) => failures.push(infra(format!("{e:#}"))),
+        }
+        let conflicts = tape::conflicts();
+        let provenance = serde_json::json!({
+            "git_sha": git_sha,
+            "kernel": KernelClass::detect(),
+            "conflicts": conflicts,
+            "recorded_at": chrono::Utc::now().to_rfc3339(),
+        });
+        match tape::write_recording(provenance) {
+            Ok((path, n)) => eprintln!(
+                "  model tape: {n} entries -> {} (conflicts {conflicts:?})",
+                path.display()
+            ),
+            Err(e) => failures.push(infra(format!("writing the tape: {e:#}"))),
+        }
+    } else {
+        tape::require_verified_models();
+    }
+    let problems = tape::take_problems();
+    const SHOWN: usize = 20;
+    for p in problems.iter().take(SHOWN) {
+        failures.push(infra(p.clone()));
+    }
+    if problems.len() > SHOWN {
+        failures.push(infra(format!(
+            "and {} more problems",
+            problems.len() - SHOWN
+        )));
+    }
+    failures
+}
+
+/// Score, through the tape, every (query, corpus item) pair it does not hold yet.
+///
+/// The queries are the ones the run sent to the reranker. The candidates are the
+/// corpus contents, which must include every text the reranker saw: if one is not a
+/// corpus item, candidates are built some other way and the corpus cannot complete
+/// the table. Batches follow the reranker's depth, as `recall()` scores them.
+fn fill_cross_encoder_table(corpus: &[CorpusItem]) -> Result<usize> {
+    use crate::embeddings::model_tape as tape;
+    let ce = crate::memory::cross_encoder().context(
+        "no cross-encoder is loaded, so the recording cannot complete its table          (was SHODH_CE_RERANK=1 set?)",
+    )?;
+    let mut seen = std::collections::HashSet::new();
+    let docs: Vec<&str> = corpus
+        .iter()
+        .map(|c| c.content.as_str())
+        .filter(|d| seen.insert(*d))
+        .collect();
+    let foreign: Vec<String> = tape::cross_encoder_docs()
+        .into_iter()
+        .filter(|d| !seen.contains(d.as_str()))
+        .collect();
+    if let Some(first) = foreign.first() {
+        anyhow::bail!(
+            "{} candidate texts the reranker saw are not corpus contents (first: {:?}),              so the corpus cannot complete the cross-encoder table",
+            foreign.len(),
+            first.chars().take(80).collect::<String>()
+        );
+    }
+    let depth = crate::memory::ce_depth();
+    let mut scored = 0;
+    for query in tape::cross_encoder_queries() {
+        let missing: Vec<&str> = docs
+            .iter()
+            .copied()
+            .filter(|d| !tape::has_cross_encoding(&query, d))
+            .collect();
+        for chunk in missing.chunks(depth) {
+            ce.score_pairs(&query, chunk)
+                .with_context(|| format!("scoring pairs for query {query:?}"))?;
+            scored += chunk.len();
+        }
+    }
+    Ok(scored)
+}
+
 /// Pin parallel runtimes to a single thread for the harness process.
 ///
 /// Recall harness reproducibility requires that two runs of the same query
@@ -889,36 +1746,118 @@ fn run_one_pass(
 /// This function only sets each variable when it is currently unset, so a
 /// caller that explicitly chose a different value (e.g. for a benchmark)
 /// keeps their override.
-fn pin_harness_threads() {
-    // SAFETY: env mutation is process-wide. The harness is the sole entry
-    // point that calls this; the production server never invokes the
-    // recall harness, so we are not racing other readers in any deployed
-    // binary. The recall-eval CLI is single-threaded at startup.
-    unsafe {
-        if std::env::var_os("SHODH_ONNX_THREADS").is_none() {
-            std::env::set_var("SHODH_ONNX_THREADS", "1");
+///
+/// # Why this returns a guard
+///
+/// It used to return `()` and never restore anything. That is harmless in the
+/// `recall_eval` binary, whose entire process IS the harness — but inside
+/// `cargo test` the harness is a handful of tests sharing one process with a
+/// thousand others, and the pin leaked to all of them. `SHODH_RECALL_READONLY=1`
+/// in particular silently disabled reinforcement for every test that ran
+/// afterwards or alongside, and it stayed invisible because nothing asserted
+/// that the default path still reinforces. That variable is no longer written
+/// here at all — see [`HarnessEnvPin::recall_read_only`] — but the same leak
+/// applies to the three that remain.
+///
+/// The previous fix wrapped the harness's own tests in a guard. That is a fix
+/// you have to remember at seven call sites and at every future one, and it
+/// restored only one of the four variables this function sets. Returning the
+/// guard from the function that does the damage removes the choice: a caller
+/// that ignores the return value drops it immediately and the pin lasts zero
+/// statements, which is loud rather than silent.
+#[must_use = "dropping the pin immediately restores the env; bind it for the \
+              lifetime of the harness run"]
+pub(crate) fn pin_harness_threads() -> HarnessEnvPin {
+    HarnessEnvPin::acquire()
+}
+
+/// The process-wide variables [`pin_harness_threads`] pins, in the order they
+/// are applied. Every entry is `set only if unset`.
+///
+/// `SHODH_RECALL_READONLY` is deliberately NOT in this list any more. It is the
+/// one determinism variable that changes observable behaviour for any code that
+/// happens to be running (recall stops writing usage state), so a process-wide
+/// pin of it is not just a leak on the way out — it is visible to every other
+/// thread for the whole duration of the run. A mutex serialises writers, not
+/// readers, so no lock can contain that. The harness now carries the decision
+/// on the `Query` it issues instead; see [`HarnessEnvPin::recall_read_only`].
+const HARNESS_ENV_PINS: [(&str, &str); 3] = [
+    // MiniLM/NER intra-op single-threaded: multi-threaded float reductions
+    // accumulate in non-deterministic order.
+    ("SHODH_ONNX_THREADS", "1"),
+    // Any par_iter() in scoring runs serially, same reason.
+    ("RAYON_NUM_THREADS", "1"),
+    // Freeze the scoring clock. Repeat passes execute minutes apart; with a live
+    // clock the recency component of every score drifts between repeats, which
+    // is enough to flip near-tie adjacent ranks (smoke-094) and trip the
+    // determinism gate on noise unrelated to the code under test. The anchor is
+    // FIXED (not run-start) because corpus created_at values are static
+    // fixtures: a live anchor would erode recency a little more every real day,
+    // silently rotting baseline.json until some near-tie flips weeks later.
+    ("SHODH_EVAL_NOW", HARNESS_CLOCK_ANCHOR),
+];
+
+/// RAII pin of the harness determinism env. Holds the crate-wide
+/// [`crate::memory::RECALL_ENV_LOCK`] so no other thread can mutate the same
+/// variables concurrently, and restores every previous value on drop.
+///
+/// The lock is reentrant, so a caller that already pinned (e.g. a test holding
+/// `RecallEnvPin`) can call a suite entry point without deadlocking.
+pub(crate) struct HarnessEnvPin {
+    _lock: parking_lot::ReentrantMutexGuard<'static, ()>,
+    previous: [(&'static str, Option<std::ffi::OsString>); HARNESS_ENV_PINS.len()],
+    recall_read_only: bool,
+}
+
+impl HarnessEnvPin {
+    fn acquire() -> Self {
+        let lock = crate::memory::RECALL_ENV_LOCK.lock();
+        let previous = HARNESS_ENV_PINS.map(|(key, value)| {
+            let prior = std::env::var_os(key);
+            if prior.is_none() {
+                // Process-wide mutation, but this thread holds RECALL_ENV_LOCK
+                // for the guard's whole lifetime, and that is the only lock any
+                // harness env mutation in this crate takes.
+                std::env::set_var(key, value);
+            }
+            (key, prior)
+        });
+        // Same decision the process-wide pin used to encode, read once instead
+        // of written once: unset means read-only (repeats measure variance, not
+        // learning curves), and the documented opt-out for learning-curve
+        // experiments is an explicit `SHODH_RECALL_READONLY` that is not "1".
+        // Reading an env var is safe against concurrent readers; writing one is
+        // what was never safe.
+        let recall_read_only = match std::env::var_os("SHODH_RECALL_READONLY") {
+            None => true,
+            Some(v) => v.to_str() == Some("1"),
+        };
+        Self {
+            _lock: lock,
+            previous,
+            recall_read_only,
         }
-        if std::env::var_os("RAYON_NUM_THREADS").is_none() {
-            std::env::set_var("RAYON_NUM_THREADS", "1");
-        }
-        // Repeats measure variance, not learning curves: recall must not
-        // mutate usage state mid-eval. FLAT fusion made graph magnitude
-        // load-bearing, so first-repeat co-activation writes were shifting
-        // later repeats' rankings (L1 smoke non-determinism). Learning-curve
-        // experiments opt out by setting SHODH_RECALL_READONLY=0 explicitly.
-        if std::env::var_os("SHODH_RECALL_READONLY").is_none() {
-            std::env::set_var("SHODH_RECALL_READONLY", "1");
-        }
-        // Freeze the scoring clock. Repeat passes execute minutes apart; with
-        // a live clock the recency component of every score drifts between
-        // repeats, which is enough to flip near-tie adjacent ranks (smoke-094)
-        // and trip the determinism gate on noise unrelated to the code under
-        // test. The anchor is FIXED (not run-start) because corpus created_at
-        // values are static fixtures: a live anchor would also erode recency
-        // a little more every real day, silently rotting baseline.json until
-        // some near-tie flips weeks after it was generated.
-        if std::env::var_os("SHODH_EVAL_NOW").is_none() {
-            std::env::set_var("SHODH_EVAL_NOW", HARNESS_CLOCK_ANCHOR);
+    }
+
+    /// Whether recalls issued during this harness run must perform no usage
+    /// writes. Set on every `Query` the harness builds, so the harness gets a
+    /// reproducible corpus without a process property that unrelated threads
+    /// can observe.
+    pub(crate) fn recall_read_only(&self) -> bool {
+        self.recall_read_only
+    }
+}
+
+impl Drop for HarnessEnvPin {
+    fn drop(&mut self) {
+        // Restore in reverse application order so nested pins unwind LIFO.
+        for (key, prior) in self.previous.iter_mut().rev() {
+            // Still holding RECALL_ENV_LOCK: the guard field is dropped after
+            // this loop.
+            match prior.take() {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
         }
     }
 }
@@ -941,6 +1880,21 @@ pub const EVAL_USER: &str = "recall-eval";
 /// activation / lineage / ontology layer disabled. The manager wires a per-user
 /// graph + NER, so the eval exercises the same ingest path production does.
 pub(crate) fn build_manager(storage_path: &Path) -> Result<MultiUserMemoryManager> {
+    // The env has to be pinned while MultiUserMemoryManager::new runs, because
+    // that call initialises the embedder and NER sessions and reads the thread
+    // counts from the env. Unpinned they would take the PRODUCTION default of
+    // 24 ONNX threads on a 4-core runner, whose float reductions accumulate in
+    // a non-deterministic order.
+    //
+    // The guard is bound for this function only. It restores the env when
+    // build_manager returns, so it covers construction and nothing after it:
+    // the frozen scoring clock and single-threaded rayon that queries rely on
+    // come from the caller's own pin_harness_threads(), held for the whole
+    // measurement. This used to be a bare `pin_harness_threads();` described
+    // as the chokepoint that made the entry-point pins redundant. The guard
+    // was dropped on the same statement, so it pinned nothing, and the entry
+    // points were never redundant.
+    let _harness_env = pin_harness_threads();
     std::fs::create_dir_all(storage_path)
         .with_context(|| format!("creating storage dir {}", storage_path.display()))?;
     MultiUserMemoryManager::new(storage_path.to_path_buf(), ServerConfig::default())
@@ -955,10 +1909,95 @@ pub(crate) fn build_manager(storage_path: &Path) -> Result<MultiUserMemoryManage
 /// memory, then build the entity graph from it. Without the
 /// `process_experience_into_graph` step the graph stays empty and Layer 2
 /// spreading activation is a no-op.
+/// Refuse to measure on the rule-based fallback NER.
+///
+/// This lives at the INGEST chokepoint rather than at each entry point, and the
+/// placement is the fix. The gate previously existed only inside `run_one_pass`
+/// and `run_longmemeval`; the other seven measurement paths that build a corpus
+/// -- `analyze_ablation`, `analyze_funnel`, `analyze_graph_reachability`,
+/// `analyze_linking`, `run_learning_arm`, `ingest_fresh` and
+/// `analyze_selective_forgetting` -- had none, so they would quietly measure a
+/// different recogniser than the one production ships and report the result as
+/// if it were the system.
+///
+/// That is not hypothetical. `.github/workflows/locomo-recall.yml` drives
+/// `--ablation`, `--funnel`, `--forgetting` and `--learning` and fetches no
+/// GLiNER model at all, while `recall.yml` fetches and verifies it. The
+/// ablation matrix -- the instrument behind the graph lever verdicts -- was on
+/// the fallback path, and nothing in its output said so.
+///
+/// Every path reaches ingest, so a guard here cannot be forgotten by a path
+/// written later. `SHODH_ALLOW_FALLBACK_NER=1` remains the visible escape
+/// hatch, and `cfg!(test)` is exempt because lib tests exercise the harness
+/// MACHINERY on runners that may lack the model -- the gate protects
+/// MEASUREMENTS, and the recall-eval binary is never `cfg(test)`.
+pub(crate) fn guard_ner_backend(manager: &MultiUserMemoryManager) -> Result<()> {
+    let backend = if manager.get_neural_ner().is_fallback_mode() {
+        "fallback"
+    } else {
+        "neural"
+    };
+    eprintln!("NER_BACKEND={backend}");
+    if backend == "fallback"
+        && !cfg!(test)
+        && !std::env::var("SHODH_ALLOW_FALLBACK_NER")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    {
+        anyhow::bail!(
+            "recall harness refusing to run on the FALLBACK NER (model not              loaded) -- results would not measure the shipped system. Provide              the pinned model or set SHODH_ALLOW_FALLBACK_NER=1 to override              visibly."
+        );
+    }
+    Ok(())
+}
+
+/// Refuse to run a cross-encoder arm without the cross-encoder.
+///
+/// `recall()` degrades to the unreranked ranking when the model is missing,
+/// which is right for a server and catastrophic for a measurement: the arm
+/// completes, reports a delta of 0.0000, and that zero reads as "the reranker
+/// does nothing" rather than "the reranker never ran". This session has already
+/// produced one such zero (`SHODH_GRAPH_PATH_STATE` set without its
+/// prerequisite, run 33603657064) and eight archived A/B workflows provisioned
+/// GLiNER zero times.
+///
+/// So the flag that turns the lever ON also makes its absence fatal HERE, at
+/// the harness, while leaving the server's graceful degradation intact.
+pub(crate) fn guard_cross_encoder() -> Result<()> {
+    let enabled = crate::memory::ce_rerank_enabled();
+    let dir = crate::embeddings::cross_encoder::CrossEncoder::model_dir();
+    guard_cross_encoder_at(enabled, &dir)
+}
+
+/// The decision, split from the env read so it is testable without mutating
+/// process env — `set_var` is not thread-safe against concurrent readers on
+/// other test threads, and this crate already carries one global lock because
+/// of that.
+pub(crate) fn guard_cross_encoder_at(enabled: bool, dir: &std::path::Path) -> Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+    match crate::embeddings::cross_encoder::CrossEncoder::load(dir) {
+        Ok(_) => {
+            eprintln!("CE_RERANK=on model={}", dir.display());
+            Ok(())
+        }
+        Err(e) => anyhow::bail!(
+            "SHODH_CE_RERANK=1 but the cross-encoder failed to load from {}: {e}. \
+             Refusing to run: recall() would silently fall back to the unreranked \
+             ranking and this arm would report a zero that looks like a verdict. \
+             Provision the model or unset SHODH_CE_RERANK.",
+            dir.display()
+        ),
+    }
+}
+
 pub fn ingest_corpus(
     manager: &MultiUserMemoryManager,
     corpus: &[CorpusItem],
 ) -> Result<HashMap<String, Uuid>> {
+    guard_ner_backend(manager)?;
+    guard_cross_encoder()?;
     let mut map = HashMap::with_capacity(corpus.len());
     let ner = manager.get_neural_ner();
     let user_mem = manager.get_user_memory(EVAL_USER)?;
@@ -1013,7 +2052,15 @@ pub fn ingest_corpus(
             content: item.content.clone(),
             entities: merged.clone(),
             tags: merged,
+            // Faithful to the handler (remember.rs): the request's own tags are
+            // the caller's entity assertions and are kept unmerged, because the
+            // graph admits a node on that authority. Dropping this here would
+            // measure a pipeline the server does not run.
+            declared_entities: item.tags.clone(),
             ner_entities,
+            // Benchmark corpus, not a user's memory. Stamped so an eval store
+            // is distinguishable from a real one.
+            origin: crate::memory::types::MemoryOrigin::RecallHarness,
             ..Default::default()
         };
 
@@ -1076,6 +2123,36 @@ pub fn ingest_corpus(
         );
     }
 
+    // The other half of the same question. A lost COMMIT means the batch never
+    // reached disk; a lost INSERT means the document never reached the writer.
+    // The guard above caught only the first, so a memory that failed to index
+    // passed this check and was then measured as though it were retrievable.
+    let (vec_lost, lex_lost) = user_mem.read().index_failure_counts();
+    if vec_lost > 0 || lex_lost > 0 {
+        anyhow::bail!(
+            "index lost {vec_lost} vector and {lex_lost} lexical insert(s) during ingest — \
+             those memories are stored but unreachable, so recall would be measured against \
+             a corpus smaller than the one that was ingested. This is an infrastructure \
+             failure, not a retrieval result."
+        );
+    }
+
+    // Both guards above trust that a loss announced itself; this one compares
+    // populations, so it catches one that did not. Shortfall only: all three
+    // counts are per memory, so chunking cannot produce a surplus, and an index
+    // entry with no stored memory behind it is a stale index — a different
+    // defect from the one this guards.
+    let (stored, vec_idx, lex_idx) = user_mem.read().index_coverage()?;
+    if vec_idx < stored || lex_idx < stored {
+        anyhow::bail!(
+            "index coverage shortfall after ingest: {stored} stored, {vec_idx} in the vector \
+             index, {lex_idx} in the lexical index. Memories that are stored but not indexed \
+             are unretrievable, so recall would be measured against a corpus smaller than the \
+             one ingested. No insert or commit error was raised for this — the counters above \
+             are clean — which means the loss was silent."
+        );
+    }
+
     Ok(map)
 }
 
@@ -1105,6 +2182,11 @@ struct LongMemEvalCase {
 }
 
 /// Aggregate LongMemEval result.
+///
+/// Serialisable so that a sharded run can be recombined: every mean is carried
+/// with its own count, so shards aggregate as a count-weighted mean rather than
+/// a mean of means.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LongMemEvalReport {
     pub questions: usize,
     pub recall_at_k: f64,
@@ -1120,6 +2202,24 @@ pub struct LongMemEvalReport {
     pub layers: BTreeMap<String, (f64, usize)>,
 }
 
+/// Resolve a shard's `[start, end)` window over a manifest of `len` cases.
+///
+/// `offset` skips that many cases; `limit` bounds how many follow. Both saturate
+/// at `len`, so an out-of-range shard yields an empty window rather than
+/// panicking — with a fixed shard count and a variable question total, the tail
+/// shards are routinely out of range.
+///
+/// The correctness claim this exists to pin: for `offset = i * per` and
+/// `limit = per`, the windows are disjoint and cover `0..len` exactly once.
+fn shard_window(len: usize, offset: Option<usize>, limit: Option<usize>) -> (usize, usize) {
+    let start = offset.unwrap_or(0).min(len);
+    let end = match limit {
+        Some(n) => start.saturating_add(n).min(len),
+        None => len,
+    };
+    (start, end)
+}
+
 /// Run the LongMemEval-S suite (ICLR 2025, the current SOTA long-term memory
 /// benchmark). UNLIKE LoCoMo, each question carries its OWN ~48-session haystack
 /// (~115K tokens), so this is a LOOP of mini-evals: per question, ingest its
@@ -1133,11 +2233,12 @@ pub struct LongMemEvalReport {
 pub fn run_longmemeval(
     base_dir: &Path,
     storage_root: &Path,
+    offset: Option<usize>,
     limit: Option<usize>,
     k: usize,
     layer_modes: &[LayerMode],
 ) -> Result<LongMemEvalReport> {
-    pin_harness_threads();
+    let _harness_env = pin_harness_threads();
 
     let manifest_path = base_dir.join("manifest.jsonl");
     let manifest_txt = std::fs::read_to_string(&manifest_path)
@@ -1146,9 +2247,14 @@ pub fn run_longmemeval(
     for line in manifest_txt.lines().filter(|l| !l.trim().is_empty()) {
         cases.push(serde_json::from_str(line).context("parsing LongMemEval manifest line")?);
     }
-    if let Some(n) = limit {
-        cases.truncate(n);
-    }
+    // Shard selection: skip `offset` cases, then take `limit`. LongMemEval-S
+    // gives every question its OWN ~490-turn haystack, so cost is linear in
+    // questions and a full run cannot fit one job's timeout. Disjoint
+    // (offset, limit) windows let parallel jobs cover the suite exactly once.
+    // The manifest order is deterministic - the converter's `--shuffle` is a
+    // stable sort - so the windows are stable across jobs and across reruns.
+    let (start, end) = shard_window(cases.len(), offset, limit);
+    cases = cases.drain(start..end).collect();
 
     let mut sum_recall = 0.0f64;
     let mut sum_p1 = 0.0f64;
@@ -1231,6 +2337,7 @@ pub fn run_longmemeval(
             query_text: Some(case.question.clone()),
             max_results: k,
             layers: primary_mode,
+            read_only: _harness_env.recall_read_only(),
             ..Default::default()
         };
         manager.annotate_query_ner(&mut query);
@@ -1387,7 +2494,7 @@ pub fn run_longmemeval(
 /// change what is stored and need separate ingests — run those via the workflow's
 /// before/after `ref` A/B instead.
 pub fn analyze_ablation(inputs: &RunInputs) -> Result<AblationReport> {
-    pin_harness_threads();
+    let _harness_env = pin_harness_threads();
 
     let corpus_path = inputs
         .corpus_path
@@ -1403,56 +2510,48 @@ pub fn analyze_ablation(inputs: &RunInputs) -> Result<AblationReport> {
         .with_context(|| format!("loading cases from {}", cases_path.display()))?;
     fixtures::validate_structure(&corpus, &cases)
         .with_context(|| format!("{} suite failed structural validation", inputs.suite))?;
+    // The same fast-read caps as the recall run and the funnel; unset means full
+    // scale. Without them a LoCoMo matrix always ran every one of its cases.
+    let (cases, corpus) = apply_eval_caps(cases, corpus);
+
+    let configs = ablation_configs();
+    preflight_ablation_env(&configs)?;
+    if configs.iter().any(|c| c.sets("SHODH_CE_RERANK")) {
+        // `recall()` caches a failed cross-encoder load for the life of the
+        // process and falls back to the unreranked ranking, so a missing model
+        // would make every cross-encoder arm a silent copy of its reference.
+        // Prove the model loads before spending the ingest.
+        guard_cross_encoder_at(
+            true,
+            &crate::embeddings::cross_encoder::CrossEncoder::model_dir(),
+        )?;
+    }
 
     let manager = build_manager(&inputs.storage_path)?;
     let id_map = ingest_corpus(&manager, &corpus)?;
     let system = manager.get_user_memory(EVAL_USER)?;
 
-    // Query-time ablation configs: (display name, [(env_key, env_val)]). Add a
-    // row here whenever a new query-time fix lands — that is how a fix becomes a
-    // measured, comparable line in the study.
-    let configs: Vec<(&str, Vec<(&str, &str)>)> = vec![
-        (
-            "facts-off (lexical+graph)",
-            vec![("SHODH_DISABLE_FACT_LAYERS", "1")],
-        ),
-        ("baseline (facts on)", vec![]),
-        ("graph-off", vec![("SHODH_GRAPH_FUSION_WEIGHT", "0")]),
-        ("+graph-expand(K5)", vec![("SHODH_GRAPH_EXPAND_K", "5")]),
-        (
-            "+graph-expand+margin",
-            vec![
-                ("SHODH_GRAPH_EXPAND_K", "5"),
-                ("SHODH_GRAPH_EXPAND_MIN_STRENGTH", "0.3"),
-            ],
-        ),
-        // Graph-leg boost form. The semantic leg modulates score multiplicatively with
-        // the canonical scales; this leg adds the pre-migration GRAPH_* scales. Measures
-        // whether unifying the form helps the graph leg survive fusion. See
-        // constants.rs GRAPH_RECENCY_BOOST_SCALE.
-        (
-            "+graph-boost-mult",
-            vec![("SHODH_GRAPH_BOOST_MULTIPLICATIVE", "1")],
-        ),
-        (
-            "+graph-boost-mult+expand",
-            vec![
-                ("SHODH_GRAPH_BOOST_MULTIPLICATIVE", "1"),
-                ("SHODH_GRAPH_EXPAND_K", "5"),
-            ],
-        ),
-        // NOTE: the former `+spread-fix` / `+expand+spread-fix` arms are gone. They set
-        // SHODH_SPREAD_FIX, which only reached the legacy BFS spread — but SHODH_PPR
-        // defaults ON and its branch precedes that path, so the flag could not execute
-        // and those two rows silently duplicated `baseline` and `+graph-expand(K5)`.
-        // The flag itself has been deleted as falsified (see graph_retrieval.rs).
-        // An arm that cannot differ from baseline is worse than no arm: it reports a
-        // number attributable to nothing. Before adding a row here, confirm the config
-        // it sets can actually reach the code path it names.
-    ];
+    // One case through the live recall path, under whatever env is set now.
+    let recall_ids = |case: &SmokeCase| -> Vec<Uuid> {
+        let query = Query {
+            query_text: Some(case.query.clone()),
+            max_results: SMOKE_K,
+            layers: LayerMode::Full,
+            read_only: _harness_env.recall_read_only(),
+            ..Default::default()
+        };
+        system
+            .read()
+            .recall(&query)
+            .unwrap_or_default()
+            .iter()
+            .map(|m| m.id.0)
+            .collect()
+    };
 
     let mut rows: Vec<AblationRow> = Vec::with_capacity(configs.len());
-    for (name, env) in &configs {
+    for config in &configs {
+        let (name, env) = (config.name, &config.env);
         // SAFETY: the harness is single-threaded (pin_harness_threads) and the
         // production server never invokes it, so process-wide env mutation here
         // races no other reader. Set before the query pass, clear after.
@@ -1464,18 +2563,23 @@ pub fn analyze_ablation(inputs: &RunInputs) -> Result<AblationReport> {
 
         let mut by_cat: HashMap<SmokeCategory, Vec<f64>> = HashMap::new();
         let mut all: Vec<Metrics> = Vec::with_capacity(cases.len());
+        let mut per_case: Vec<AblationCaseRow> = Vec::with_capacity(cases.len());
+        // Order-sensitive fingerprint over every retrieved id. An arm that
+        // matches its reference here provably changed nothing.
+        let mut fp = std::collections::hash_map::DefaultHasher::new();
         for case in &cases {
-            let query = Query {
-                query_text: Some(case.query.clone()),
-                max_results: SMOKE_K,
-                layers: LayerMode::Full,
-                ..Default::default()
-            };
-            let memories = system.read().recall(&query).unwrap_or_default();
-            let retrieved: Vec<Uuid> = memories.iter().map(|m| m.id.0).collect();
+            let retrieved = recall_ids(case);
+            hash_retrieved(&mut fp, &retrieved);
             let relevance = build_relevance_map(case, &id_map);
             let m = Metrics::compute(&retrieved, &relevance, SMOKE_K);
             by_cat.entry(case.category).or_default().push(m.recall_at_k);
+            per_case.push(AblationCaseRow {
+                case_id: case.id.clone(),
+                category: category_name(case.category).to_string(),
+                recall_at_k: m.recall_at_k,
+                p_at_1: m.p_at_1,
+                ndcg_at_k: m.ndcg_at_k,
+            });
             all.push(m);
         }
 
@@ -1501,15 +2605,528 @@ pub fn analyze_ablation(inputs: &RunInputs) -> Result<AblationReport> {
             mrr: all.iter().map(|m| m.mrr).sum::<f64>() / n,
             p_at_1: all.iter().map(|m| m.p_at_1).sum::<f64>() / n,
             by_category_recall,
+            retrieval_fingerprint: {
+                use std::hash::Hasher;
+                fp.finish()
+            },
+            vacuous_vs_reference: false,
+            reference: config.reference.map(str::to_string),
+            delta_recall_at_10: None,
+            delta_p_at_1: None,
+            per_case,
         });
     }
+
+    // Trailing baseline replicate: the baseline's queries again, with no arm env
+    // set, after every arm has run. Arms share one process and set then remove
+    // their flags, so a flag read once into a cache would stay stuck for every
+    // later arm -- and those arms would still DIFFER from their reference, so the
+    // vacuity check cannot see it. Only re-measuring the reference point at the
+    // end can. It is also the cleanest query-time determinism check the harness
+    // takes: one ingest, one process, identical queries minutes apart.
+    let replicate_fp = {
+        let mut fp = std::collections::hash_map::DefaultHasher::new();
+        for case in &cases {
+            hash_retrieved(&mut fp, &recall_ids(case));
+        }
+        std::hash::Hasher::finish(&fp)
+    };
+    let baseline_replicate_identical = rows
+        .iter()
+        .find(|r| r.reference.is_none())
+        .map(|r| r.retrieval_fingerprint == replicate_fp);
+    match baseline_replicate_identical {
+        Some(true) => eprintln!("  baseline replicate: identical to the first baseline pass"),
+        Some(false) => {
+            tracing::warn!("ABLATION BASELINE REPLICATE DIFFERS from the first baseline pass");
+            eprintln!(
+                "  !! baseline replicate DIFFERS from the first pass: an arm left state \
+                 behind, or query-time retrieval is not deterministic on a fixed ingest. \
+                 Every delta in this matrix carries that difference as noise."
+            );
+        }
+        None => {}
+    }
+
+    // Deltas and the vacuity check, each against the arm's own reference.
+    resolve_against_references(&mut rows)?;
 
     Ok(AblationReport {
         suite: inputs.suite.clone(),
         git_sha: inputs.git_sha.clone(),
         case_count: cases.len(),
         rows,
+        baseline_replicate_identical,
     })
+}
+
+/// Fold one case's ranked ids into an order-sensitive run fingerprint.
+fn hash_retrieved(fp: &mut std::collections::hash_map::DefaultHasher, ids: &[Uuid]) {
+    use std::hash::Hash;
+    for id in ids {
+        id.hash(fp);
+    }
+    // Separator so [a],[b] and [a,b] cannot collide.
+    0xFFu8.hash(fp);
+}
+
+/// The arm every shipped-operating-point arm is measured against.
+const ABLATION_BASELINE: &str = "baseline (facts on)";
+/// The arm every cross-encoder arm is measured against.
+const ABLATION_CE_BASELINE: &str = "baseline +ce";
+/// Bootstrap resamples per paired delta. At 2000 the Monte-Carlo wobble of an
+/// interval endpoint is about 0.06 standard errors of the mean difference,
+/// small against the interval's own width of about four.
+const ABLATION_BOOTSTRAP_RESAMPLES: usize = 2000;
+/// Fixed so a report regenerated from the same per-case data carries the same
+/// intervals.
+const ABLATION_BOOTSTRAP_SEED: u64 = 0x5EED_AB1A;
+
+/// One arm of the ablation matrix: the env overrides it applies and the arm it
+/// is measured against.
+struct AblationConfig {
+    name: &'static str,
+    env: Vec<(&'static str, &'static str)>,
+    /// `None` only for the baseline. Every other arm is its reference plus the
+    /// flags it adds, so its delta is attributable to exactly those flags.
+    reference: Option<&'static str>,
+}
+
+impl AblationConfig {
+    fn sets(&self, key: &str) -> bool {
+        self.env.iter().any(|(k, _)| *k == key)
+    }
+}
+
+/// Every arm of the ablation matrix.
+///
+/// Add an arm whenever a query-time lever lands; that is how a lever becomes a
+/// measured, comparable line in the study. Before adding one, confirm the flag
+/// it sets can reach the code path it names: an arm that cannot differ from its
+/// reference reports a number attributable to nothing (see the vacuity check in
+/// [`resolve_against_references`]). The former `+spread-fix` arms were exactly
+/// that -- SHODH_SPREAD_FIX only reached the legacy BFS spread, SHODH_PPR
+/// defaults ON and its branch precedes it, and the rows silently duplicated
+/// `baseline` and `+graph-expand(K5)` until the flag was deleted as falsified.
+///
+/// Two operating points. Arms referencing [`ABLATION_BASELINE`] measure the
+/// library default, with the cross-encoder OFF: `recall-eval` never runs
+/// `server::run`, so the server's default-on does not reach it, and
+/// [`preflight_ablation_env`] refuses a preset `SHODH_CE_RERANK`. Arms
+/// referencing [`ABLATION_CE_BASELINE`] measure the pipeline as the server
+/// ships it, with the reranker in, so a leg's contribution is also read where
+/// the largest measured lever is present.
+///
+/// Any arm that sets `SHODH_DISABLE_BOOSTS` must include `hebbian` (or `all`):
+/// setting the variable REPLACES the default-disabled set rather than adding to
+/// it, so an arm naming one family alone silently re-enables the Hebbian rank
+/// boost measured as an ordering saboteur and conflates the two effects.
+fn ablation_configs() -> Vec<AblationConfig> {
+    fn arm(
+        name: &'static str,
+        reference: &'static str,
+        env: &[(&'static str, &'static str)],
+    ) -> AblationConfig {
+        AblationConfig {
+            name,
+            env: env.to_vec(),
+            reference: Some(reference),
+        }
+    }
+    const CE: (&str, &str) = ("SHODH_CE_RERANK", "1");
+    const NO_BM25: (&str, &str) = ("SHODH_ABLATE_BM25", "1");
+    const NO_SPREADING: (&str, &str) = ("SHODH_ABLATE_SPREADING", "1");
+    // `all` also flips the two form-selecting families (`linguistic_resort`,
+    // `size_gated_final_sort`) to their alternative forms, so this is "every
+    // boost off and the final order by score", not only the semantic stack.
+    const NO_BOOSTS: (&str, &str) = ("SHODH_DISABLE_BOOSTS", "all");
+    const B: &str = ABLATION_BASELINE;
+    const B_CE: &str = ABLATION_CE_BASELINE;
+
+    vec![
+        AblationConfig {
+            name: ABLATION_BASELINE,
+            env: vec![],
+            reference: None,
+        },
+        arm(
+            "facts-off (lexical+graph)",
+            B,
+            &[("SHODH_DISABLE_FACT_LAYERS", "1")],
+        ),
+        arm("graph-off", B, &[("SHODH_GRAPH_FUSION_WEIGHT", "0")]),
+        arm("+graph-expand(K5)", B, &[("SHODH_GRAPH_EXPAND_K", "5")]),
+        arm(
+            "+graph-expand+margin",
+            B,
+            &[
+                ("SHODH_GRAPH_EXPAND_K", "5"),
+                ("SHODH_GRAPH_EXPAND_MIN_STRENGTH", "0.3"),
+            ],
+        ),
+        // Graph-leg boost form. The semantic leg modulates score multiplicatively
+        // with the canonical scales; this leg adds the pre-migration GRAPH_* scales.
+        // Measures whether unifying the form helps the graph leg survive fusion.
+        // See constants.rs GRAPH_RECENCY_BOOST_SCALE.
+        arm(
+            "+graph-boost-mult",
+            B,
+            &[("SHODH_GRAPH_BOOST_MULTIPLICATIVE", "1")],
+        ),
+        // Traversal direction. Without this flag `edge_neighbor` returns
+        // `edge.to_entity` unconditionally, so standing on a node and meeting an
+        // edge that ENDS there resolves to the node itself: every incoming edge
+        // is a self-loop and the walk can only follow outgoing edges. Reachable
+        // from the live path (`edge_neighbor` is called inside PPR), so this arm
+        // can differ from baseline.
+        arm("+edge-dir", B, &[("SHODH_GRAPH_EDGE_DIR", "1")]),
+        // Composition-by-traversal: beam-search the strongest intent-matching
+        // paths from the seeds and inject the reached endpoints.
+        arm("+graph-traverse", B, &[("SHODH_GRAPH_TRAVERSE", "1")]),
+        // The two graph-leg components that had no gate before `memory::ablation`
+        // existed, and so had never been ablated in either direction.
+        arm(
+            "-lateral-inhibition",
+            B,
+            &[("SHODH_DISABLE_BOOSTS", "hebbian,lateral_inhibition")],
+        ),
+        arm(
+            "-graph-potentiation",
+            B,
+            &[("SHODH_DISABLE_BOOSTS", "hebbian,graph_potentiation")],
+        ),
+        arm(
+            "+graph-boost-mult+expand",
+            B,
+            &[
+                ("SHODH_GRAPH_BOOST_MULTIPLICATIVE", "1"),
+                ("SHODH_GRAPH_EXPAND_K", "5"),
+            ],
+        ),
+        // Leave-one-out at the shipped operating point: each removes exactly one
+        // leg or stage from the full pipeline, so its delta is that component's
+        // marginal contribution. The cumulative `--layer all` ladder cannot give
+        // this -- it attributes each stage conditional on the ones before it.
+        arm("-bm25", B, &[NO_BM25]),
+        arm("-spreading", B, &[NO_SPREADING]),
+        arm("-boost-stack", B, &[NO_BOOSTS]),
+        // Single-leg isolation (`SHODH_LEG`): one leg's candidates only, so the
+        // delta is what the other two legs are worth together.
+        arm("leg=vector", B, &[("SHODH_LEG", "vector")]),
+        arm("leg=bm25", B, &[("SHODH_LEG", "bm25")]),
+        arm("leg=graph", B, &[("SHODH_LEG", "graph")]),
+        // The cross-encoder itself, then the same leave-one-out and isolation arms
+        // with it in. `+ce leg=graph` is the live test of the offline finding that
+        // a graph-only pool reranked by the cross-encoder beats the full hybrid.
+        arm(ABLATION_CE_BASELINE, B, &[CE]),
+        arm("+ce -bm25", B_CE, &[CE, NO_BM25]),
+        arm("+ce -spreading", B_CE, &[CE, NO_SPREADING]),
+        arm("+ce -boost-stack", B_CE, &[CE, NO_BOOSTS]),
+        arm("+ce leg=vector", B_CE, &[CE, ("SHODH_LEG", "vector")]),
+        arm("+ce leg=bm25", B_CE, &[CE, ("SHODH_LEG", "bm25")]),
+        arm("+ce leg=graph", B_CE, &[CE, ("SHODH_LEG", "graph")]),
+    ]
+}
+
+/// The keys some arm sets that `is_set` reports as already present, sorted and
+/// deduplicated.
+fn preset_ablation_keys(
+    configs: &[AblationConfig],
+    is_set: impl Fn(&str) -> bool,
+) -> Vec<&'static str> {
+    let mut preset: Vec<&'static str> = configs
+        .iter()
+        .flat_map(|c| c.env.iter().map(|(k, _)| *k))
+        .filter(|k| is_set(k))
+        .collect();
+    preset.sort_unstable();
+    preset.dedup();
+    preset
+}
+
+/// Refuse to run when the process already carries a key some arm sets.
+///
+/// Each arm sets its keys and REMOVES them afterwards. A key already in the
+/// environment would be on for every arm before the one that sets it and gone
+/// for every arm after, so the arms would stop sharing a reference point and the
+/// deltas would measure arm order. Pass such flags to an individual arm, not to
+/// the whole run.
+fn preflight_ablation_env(configs: &[AblationConfig]) -> Result<()> {
+    let preset = preset_ablation_keys(configs, |k| std::env::var_os(k).is_some());
+    if !preset.is_empty() {
+        anyhow::bail!(
+            "ablation matrix refusing to run: {} already set in the environment. Every \
+             arm sets and then removes its own keys, so a preset key would be on for \
+             some arms and off for others, and the deltas would measure arm order. \
+             Unset them, or add an arm that sets them.",
+            preset.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Fill each arm's paired deltas and vacuity flag from the arm it names as its
+/// reference.
+///
+/// Vacuity: an arm whose retrieved ids are byte-identical to its reference's did
+/// not exercise the code path its flags name, and its delta is attributable to
+/// nothing. It is flagged rather than failed, because an arm may also be
+/// legitimately inert (it executed and changed no ranking), and only the
+/// fingerprint can tell the two apart.
+fn resolve_against_references(rows: &mut [AblationRow]) -> Result<()> {
+    let snapshot: HashMap<String, (u64, Vec<f64>, Vec<f64>)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r.name.clone(),
+                (
+                    r.retrieval_fingerprint,
+                    r.per_case.iter().map(|c| c.recall_at_k).collect(),
+                    r.per_case.iter().map(|c| c.p_at_1).collect(),
+                ),
+            )
+        })
+        .collect();
+    let ci = |control: &[f64], treatment: &[f64]| {
+        paired_bootstrap_ci(
+            control,
+            treatment,
+            ABLATION_BOOTSTRAP_RESAMPLES,
+            ABLATION_BOOTSTRAP_SEED,
+        )
+        .map(|(mean, lo, hi)| DeltaCi { mean, lo, hi })
+    };
+
+    for row in rows.iter_mut() {
+        let Some(reference) = row.reference.clone() else {
+            continue;
+        };
+        let Some((ref_fp, ref_recall, ref_p1)) = snapshot.get(&reference) else {
+            anyhow::bail!(
+                "ablation arm `{}` names `{reference}` as its reference, which is not an arm",
+                row.name
+            );
+        };
+        let recall: Vec<f64> = row.per_case.iter().map(|c| c.recall_at_k).collect();
+        let p1: Vec<f64> = row.per_case.iter().map(|c| c.p_at_1).collect();
+        row.delta_recall_at_10 = ci(ref_recall, &recall);
+        row.delta_p_at_1 = ci(ref_p1, &p1);
+
+        if row.retrieval_fingerprint == *ref_fp {
+            row.vacuous_vs_reference = true;
+            tracing::warn!(
+                arm = %row.name,
+                reference = %reference,
+                flags = %row.flags.join(" "),
+                "VACUOUS ABLATION ARM: retrieval is byte-identical to its reference, so the \
+                 flags it adds did not reach the code path they name. Its delta measures nothing."
+            );
+            eprintln!(
+                "  !! VACUOUS ARM `{}` ({}) -- byte-identical to `{}`, measures nothing",
+                row.name,
+                row.flags.join(" "),
+                reference
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod ablation_config_tests {
+    use super::*;
+
+    fn configs_by_name(configs: &[AblationConfig]) -> HashMap<&'static str, &AblationConfig> {
+        configs.iter().map(|c| (c.name, c)).collect()
+    }
+
+    #[test]
+    fn arm_names_are_unique() {
+        let configs = ablation_configs();
+        assert_eq!(configs_by_name(&configs).len(), configs.len());
+    }
+
+    #[test]
+    fn only_the_baseline_lacks_a_reference_and_it_sets_nothing() {
+        let configs = ablation_configs();
+        let roots: Vec<&AblationConfig> =
+            configs.iter().filter(|c| c.reference.is_none()).collect();
+        assert_eq!(roots.len(), 1, "exactly one arm may be unreferenced");
+        assert_eq!(roots[0].name, ABLATION_BASELINE);
+        assert!(
+            roots[0].env.is_empty(),
+            "the baseline must be the pipeline as it ships"
+        );
+    }
+
+    #[test]
+    fn every_arm_is_its_reference_plus_at_least_one_flag() {
+        let configs = ablation_configs();
+        let by_name = configs_by_name(&configs);
+        for c in &configs {
+            let Some(reference) = c.reference else {
+                continue;
+            };
+            assert_ne!(reference, c.name, "`{}` references itself", c.name);
+            let r = by_name
+                .get(reference)
+                .unwrap_or_else(|| panic!("`{}` references unknown arm `{reference}`", c.name));
+            for pair in &r.env {
+                assert!(
+                    c.env.contains(pair),
+                    "`{}` drops {pair:?} from its reference `{reference}`, so its delta \
+                     is not attributable to the flags it adds",
+                    c.name
+                );
+            }
+            assert!(
+                c.env.len() > r.env.len(),
+                "`{}` adds nothing to its reference `{reference}`",
+                c.name
+            );
+        }
+    }
+
+    #[test]
+    fn every_boost_ablation_keeps_hebbian_disabled() {
+        for c in ablation_configs() {
+            for (k, v) in &c.env {
+                if *k != "SHODH_DISABLE_BOOSTS" {
+                    continue;
+                }
+                let keeps_default = v
+                    .split(',')
+                    .map(str::trim)
+                    .any(|t| t == "hebbian" || t == "all");
+                assert!(
+                    keeps_default,
+                    "`{}` sets SHODH_DISABLE_BOOSTS={v} without `hebbian`, which silently \
+                     re-enables the default-disabled Hebbian rank boost",
+                    c.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_cross_encoder_arm_is_measured_with_the_cross_encoder_in() {
+        let configs = ablation_configs();
+        let by_name = configs_by_name(&configs);
+        for c in &configs {
+            if !c.sets("SHODH_CE_RERANK") || c.name == ABLATION_CE_BASELINE {
+                continue;
+            }
+            let reference = c.reference.expect("cross-encoder arms have a reference");
+            assert!(
+                by_name[reference].sets("SHODH_CE_RERANK"),
+                "`{}` is measured against `{reference}`, which has no cross-encoder, so its \
+                 delta would include the reranker's own effect",
+                c.name
+            );
+        }
+    }
+
+    #[test]
+    fn preset_keys_are_reported_once_each_and_only_if_an_arm_sets_them() {
+        let configs = ablation_configs();
+        let preset = preset_ablation_keys(&configs, |k| {
+            matches!(k, "SHODH_LEG" | "SHODH_CE_RERANK" | "SHODH_NOT_AN_ARM_KEY")
+        });
+        assert_eq!(preset, vec!["SHODH_CE_RERANK", "SHODH_LEG"]);
+        assert!(preset_ablation_keys(&configs, |_| false).is_empty());
+    }
+
+    fn row(name: &str, reference: Option<&str>, fingerprint: u64, recalls: &[f64]) -> AblationRow {
+        AblationRow {
+            name: name.to_string(),
+            flags: if reference.is_some() {
+                vec![format!("FLAG_FOR_{name}=1")]
+            } else {
+                vec![]
+            },
+            recall_at_10: recalls.iter().sum::<f64>() / recalls.len() as f64,
+            ndcg_at_10: 0.0,
+            mrr: 0.0,
+            p_at_1: 0.0,
+            by_category_recall: BTreeMap::new(),
+            retrieval_fingerprint: fingerprint,
+            vacuous_vs_reference: false,
+            reference: reference.map(str::to_string),
+            delta_recall_at_10: None,
+            delta_p_at_1: None,
+            per_case: recalls
+                .iter()
+                .enumerate()
+                .map(|(i, &r)| AblationCaseRow {
+                    case_id: format!("case-{i}"),
+                    category: "single_hop".to_string(),
+                    recall_at_k: r,
+                    p_at_1: r,
+                    ndcg_at_k: 0.0,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn the_fingerprint_keeps_case_boundaries_and_rank_order() {
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let finish = |cases: &[Vec<Uuid>]| {
+            let mut fp = std::collections::hash_map::DefaultHasher::new();
+            for ids in cases {
+                hash_retrieved(&mut fp, ids);
+            }
+            std::hash::Hasher::finish(&fp)
+        };
+        assert_ne!(finish(&[vec![a], vec![b]]), finish(&[vec![a, b]]));
+        assert_ne!(finish(&[vec![a, b]]), finish(&[vec![b, a]]));
+        assert_eq!(finish(&[vec![a, b]]), finish(&[vec![a, b]]));
+    }
+
+    #[test]
+    fn an_arm_identical_to_its_reference_is_vacuous_with_a_zero_delta() {
+        let mut rows = vec![
+            row("base", None, 7, &[0.0, 0.5, 1.0]),
+            row("inert", Some("base"), 7, &[0.0, 0.5, 1.0]),
+        ];
+        resolve_against_references(&mut rows).unwrap();
+        assert!(rows[1].vacuous_vs_reference);
+        let d = rows[1].delta_recall_at_10.unwrap();
+        assert_eq!((d.mean, d.lo, d.hi), (0.0, 0.0, 0.0));
+        assert!(
+            !rows[0].vacuous_vs_reference,
+            "the baseline has nothing to be vacuous against"
+        );
+        assert!(rows[0].delta_recall_at_10.is_none());
+    }
+
+    #[test]
+    fn a_nested_arm_is_measured_against_its_own_reference_not_the_baseline() {
+        // base 0.2 -> ce 0.6 -> ce-child 0.5. Against its reference the child
+        // loses 0.1; against the baseline it would appear to gain 0.3.
+        let mut rows = vec![
+            row("base", None, 1, &[0.2; 4]),
+            row("ce", Some("base"), 2, &[0.6; 4]),
+            row("ce-child", Some("ce"), 3, &[0.5; 4]),
+        ];
+        resolve_against_references(&mut rows).unwrap();
+        let child = rows[2].delta_recall_at_10.unwrap();
+        assert!((child.mean + 0.1).abs() < 1e-12, "got {}", child.mean);
+        assert!(child.excludes_zero());
+        let ce = rows[1].delta_recall_at_10.unwrap();
+        assert!((ce.mean - 0.4).abs() < 1e-12, "got {}", ce.mean);
+        assert!(!rows[2].vacuous_vs_reference);
+    }
+
+    #[test]
+    fn an_unknown_reference_is_an_error_not_a_skipped_row() {
+        let mut rows = vec![
+            row("base", None, 1, &[0.2]),
+            row("orphan", Some("missing"), 2, &[0.3]),
+        ];
+        let err = resolve_against_references(&mut rows).unwrap_err();
+        assert!(err.to_string().contains("missing"), "{err}");
+    }
 }
 
 /// Whole-word / phrase containment: does `name` appear in `text_lc` at word boundaries?
@@ -1542,7 +3159,7 @@ fn phrase_in_text(name: &str, text_lc: &str) -> bool {
 /// rate, and extraction counts — turning "is NER the bottleneck?" into a number. Low recall ⇒
 /// the traversal/graph starts from wrong-or-missing seeds and NER/linking is the ceiling.
 pub fn analyze_linking(inputs: &RunInputs) -> Result<LinkingReport> {
-    pin_harness_threads();
+    let _harness_env = pin_harness_threads();
 
     let corpus_path = inputs
         .corpus_path
@@ -1758,7 +3375,7 @@ fn apply_eval_caps(
 }
 
 pub fn analyze_funnel(inputs: &RunInputs) -> Result<FunnelReport> {
-    pin_harness_threads();
+    let _harness_env = pin_harness_threads();
 
     let corpus_path = inputs
         .corpus_path
@@ -1801,7 +3418,13 @@ pub fn analyze_funnel(inputs: &RunInputs) -> Result<FunnelReport> {
         .filter(|k| *k >= SMOKE_K)
         .unwrap_or(SMOKE_K);
 
-    const STAGES: [&str; 5] = ["graph", "vector", "hybrid", "fusion", "final"];
+    // `graph_pool` precedes `graph`: the leg's complete scored pool BEFORE the
+    // GRAPH_CANDIDATE_CAP/graph_leg_k truncations (recorded inside
+    // spreading_activation_retrieve_with_stats). graph_pool.present% vs
+    // graph.present% splits pool-membership loss from the exit-gate ordering
+    // cut; graph_pool.mean_rank_when_present locates where the pool ordering
+    // places gold.
+    const STAGES: [&str; 6] = ["graph_pool", "graph", "vector", "hybrid", "fusion", "final"];
 
     #[derive(Default, Clone)]
     struct Acc {
@@ -1840,12 +3463,19 @@ pub fn analyze_funnel(inputs: &RunInputs) -> Result<FunnelReport> {
         case_count += 1;
         let cat = category_name(case.category).to_string();
 
-        let query = Query {
+        let mut query = Query {
             query_text: Some(case.query.clone()),
             max_results: diag_k,
             layers: crate::memory::types::LayerMode::Full,
+            read_only: _harness_env.recall_read_only(),
             ..Default::default()
         };
+        // Match the recall path's query preparation (run_one_pass annotates both
+        // the production and the deep query): without neural-NER annotation the
+        // graph leg seeds from the POS heuristic alone, so the funnel would
+        // measure a DIFFERENTLY-SEEDED leg than the recall runs it exists to
+        // explain — every stage row, not just graph ones, shifts with the seeds.
+        manager.annotate_query_ner(&mut query);
 
         crate::memory::gold_funnel::begin(gold.clone());
         let _ = system.read().recall(&query);
@@ -1897,7 +3527,7 @@ pub fn analyze_funnel(inputs: &RunInputs) -> Result<FunnelReport> {
 }
 
 pub fn analyze_graph_reachability(inputs: &RunInputs) -> Result<ReachabilityReport> {
-    pin_harness_threads();
+    let _harness_env = pin_harness_threads();
     const MAX_HOPS: usize = 3;
     // Safety valve against hub-entity blowup on dense graphs. Far above any
     // LoCoMo component size, so it does not bias the result in practice.
@@ -1957,7 +3587,204 @@ pub fn analyze_graph_reachability(inputs: &RunInputs) -> Result<ReachabilityRepo
         degrees.sort_unstable_by(|a, b| b.cmp(a));
         let total_entities = degrees.len();
         let degree_sum: usize = degrees.iter().sum();
+
+        // Relation-type histogram over STORED edges. Walked from the entity side
+        // and de-duplicated by edge uuid, because get_entity_relationships
+        // returns an edge once from each endpoint it is reachable from and
+        // counting incidences would double most of them.
+        //
+        // SYMMETRIC types carry no order, so a path hop through one contributes
+        // nothing a composition could be non-commutative about. They are also
+        // the ones fully determined by entity->episode incidence, so this split
+        // is the same line as "stored vs derivable".
+        const SYMMETRIC: [&str; 7] = [
+            "CoOccurs",
+            "RelatedTo",
+            "AssociatedWith",
+            "CoRetrieved",
+            "WorksWith",
+            "Knows",
+            "AlternativeTo",
+        ];
+        let mut relation_types: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut seen_edges: std::collections::HashSet<uuid::Uuid> = Default::default();
+        for e in &entities {
+            for edge in g.get_entity_relationships(&e.uuid).unwrap_or_default() {
+                if !seen_edges.insert(edge.uuid) {
+                    continue;
+                }
+                *relation_types
+                    .entry(format!("{:?}", edge.relation_type))
+                    .or_insert(0) += 1;
+            }
+        }
+        let symmetric_edges: usize = relation_types
+            .iter()
+            .filter(|(name, _)| SYMMETRIC.contains(&name.as_str()))
+            .map(|(_, n)| *n)
+            .sum();
+        let typed_edges: usize = relation_types.values().sum::<usize>() - symmetric_edges;
+
+        // Entity labels. A label-pair typing rule can be correct and enabled and
+        // still never fire, because the labels it matches are not produced.
+        let mut entity_labels: std::collections::BTreeMap<String, usize> = Default::default();
+        for e in &entities {
+            if e.labels.is_empty() {
+                *entity_labels.entry("<unlabelled>".to_string()).or_insert(0) += 1;
+            }
+            for l in &e.labels {
+                *entity_labels.entry(format!("{l:?}")).or_insert(0) += 1;
+            }
+        }
+
+        // Which labels carry the CONNECTIVITY, not just which labels exist.
+        // A label that is a small share of nodes and a large share of
+        // incidences is a node type doing an attribute's job: everyone mentions
+        // "last weekend", so minting it wires every such memory into one star
+        // that no query would ever traverse deliberately.
+        //
+        // Degrees are read post-cap, so a saturated entity reports the cap and
+        // its discarded edges are invisible here. That censors the mean
+        // downward; the top_hubs list below is where saturation is legible.
+        let degree_of = |e: &crate::graph_memory::EntityNode| {
+            g.get_entity_relationships(&e.uuid)
+                .map(|r| r.len())
+                .unwrap_or(0)
+        };
+        let mut label_degrees: std::collections::BTreeMap<String, (usize, usize, usize)> =
+            Default::default();
+        for e in &entities {
+            let d = degree_of(e);
+            let names: Vec<String> = if e.labels.is_empty() {
+                vec!["<unlabelled>".to_string()]
+            } else {
+                e.labels.iter().map(|l| format!("{l:?}")).collect()
+            };
+            // Multi-label entities count under each of their labels, so these
+            // sums exceed the totals. Per-label shares stay meaningful; a
+            // partition would not.
+            for name in names {
+                let slot = label_degrees.entry(name).or_insert((0, 0, 0));
+                slot.0 += 1;
+                slot.1 += d;
+                slot.2 = slot.2.max(d);
+            }
+        }
+
+        // Identities of the top hubs. Ties broken by name so the list is
+        // reproducible across ingests -- without it, equal-degree entities
+        // would be ordered by whatever the entity scan happened to yield.
+        let mut ranked: Vec<(usize, &crate::graph_memory::EntityNode)> =
+            entities.iter().map(|e| (degree_of(e), e)).collect();
+        ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
+        let top_hubs: Vec<(String, String, usize)> = ranked
+            .iter()
+            .take(25)
+            .map(|(d, e)| {
+                let labels = if e.labels.is_empty() {
+                    "<unlabelled>".to_string()
+                } else {
+                    e.labels
+                        .iter()
+                        .map(|l| format!("{l:?}"))
+                        .collect::<Vec<_>>()
+                        .join("+")
+                };
+                (e.name.clone(), labels, *d)
+            })
+            .collect();
+
+        // Undirected adjacency, built once and reused for every component pass.
+        let index: std::collections::HashMap<uuid::Uuid, usize> = entities
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.uuid, i))
+            .collect();
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); entities.len()];
+        let mut typed_adj: Vec<Vec<usize>> = vec![Vec::new(); entities.len()];
+        let mut counted: std::collections::HashSet<uuid::Uuid> = Default::default();
+        for e in &entities {
+            for edge in g.get_entity_relationships(&e.uuid).unwrap_or_default() {
+                if !counted.insert(edge.uuid) {
+                    continue;
+                }
+                let (Some(&a), Some(&b)) =
+                    (index.get(&edge.from_entity), index.get(&edge.to_entity))
+                else {
+                    continue;
+                };
+                adj[a].push(b);
+                adj[b].push(a);
+                if !SYMMETRIC.contains(&format!("{:?}", edge.relation_type).as_str()) {
+                    typed_adj[a].push(b);
+                    typed_adj[b].push(a);
+                }
+            }
+        }
+
+        // Components by BFS over an adjacency list, with a set of deleted
+        // vertices. Iterative: a hub-heavy graph would blow a recursive stack.
+        let components = |adj: &Vec<Vec<usize>>, removed: &std::collections::HashSet<usize>| {
+            let n = adj.len();
+            let mut seen = vec![false; n];
+            let (mut count, mut largest) = (0usize, 0usize);
+            for start in 0..n {
+                if seen[start] || removed.contains(&start) {
+                    continue;
+                }
+                count += 1;
+                let mut size = 0usize;
+                let mut stack = vec![start];
+                seen[start] = true;
+                while let Some(v) = stack.pop() {
+                    size += 1;
+                    for &w in &adj[v] {
+                        if !seen[w] && !removed.contains(&w) {
+                            seen[w] = true;
+                            stack.push(w);
+                        }
+                    }
+                }
+                largest = largest.max(size);
+            }
+            (count, largest)
+        };
+
+        let n_ent = entities.len().max(1);
+        let none: std::collections::HashSet<usize> = Default::default();
+        let (c_all, l_all) = components(&adj, &none);
+        let components_all = (c_all, l_all as f64 / n_ent as f64);
+
+        // Delete the top-N by degree. A k-connected graph survives k-1
+        // deletions; if this shatters early, connectivity is hub-carried.
+        let mut by_degree: Vec<usize> = (0..entities.len()).collect();
+        by_degree.sort_unstable_by(|&a, &b| adj[b].len().cmp(&adj[a].len()).then(a.cmp(&b)));
+        let mut components_after_hub_removal = Vec::new();
+        for &k in &[1usize, 5, 10, 25] {
+            if k > by_degree.len() {
+                break;
+            }
+            let removed: std::collections::HashSet<usize> =
+                by_degree.iter().take(k).copied().collect();
+            let (c, l) = components(&adj, &removed);
+            let denom = (entities.len() - k).max(1);
+            components_after_hub_removal.push((k, c, l as f64 / denom as f64));
+        }
+
+        let (c_typed, l_typed) = components(&typed_adj, &none);
+        let isolated_typed = typed_adj.iter().filter(|a| a.is_empty()).count();
+        let typed_components = (c_typed, l_typed as f64 / n_ent as f64, isolated_typed);
+
         GraphStructure {
+            relation_types,
+            typed_edges,
+            symmetric_edges,
+            entity_labels,
+            label_degrees,
+            top_hubs,
+            components_all,
+            components_after_hub_removal,
+            typed_components,
             total_entities,
             total_edges: degree_sum / 2,
             max_degree: degrees.first().copied().unwrap_or(0),
@@ -1966,6 +3793,7 @@ pub fn analyze_graph_reachability(inputs: &RunInputs) -> Result<ReachabilityRepo
             } else {
                 degree_sum as f64 / total_entities as f64
             },
+            hub_saturation_skipped_edges: crate::metrics::HUB_SATURATION_EDGE_SKIP_TOTAL.get(),
             hub_count: degrees
                 .iter()
                 .filter(|d| **d > HUB_REPORT_THRESHOLD)
@@ -2159,6 +3987,7 @@ fn run_learning_arm(
     cyc: usize,
     outcome: RetrievalOutcome,
     outcome_name: &str,
+    read_only: bool,
 ) -> Result<LearningCurveArm> {
     const TRACK_K: usize = 50;
     const MIN_COLD_RANK: usize = 2;
@@ -2175,6 +4004,7 @@ fn run_learning_arm(
             query_text: Some(q.to_string()),
             max_results: TRACK_K,
             layers: LayerMode::Full,
+            read_only,
             ..Default::default()
         };
         match system.read().recall(&query) {
@@ -2266,7 +4096,7 @@ fn run_learning_arm(
 /// learning rate via `SHODH_REWARD_LR_MULT` and re-run to see if a stronger
 /// reward moves rank, not just score.
 pub fn analyze_learning_curve(inputs: &RunInputs, cycles: usize) -> Result<LearningCurveReport> {
-    pin_harness_threads();
+    let _harness_env = pin_harness_threads();
 
     let corpus_path = inputs
         .corpus_path
@@ -2293,8 +4123,16 @@ pub fn analyze_learning_curve(inputs: &RunInputs, cycles: usize) -> Result<Learn
     for (name, outcome) in arms_spec {
         // Fresh storage per arm — reinforcement mutates state; arms must not bleed.
         let arm_storage = inputs.storage_path.join(name.to_lowercase());
-        let arm = run_learning_arm(&arm_storage, &corpus, &cases, cyc, outcome, name)
-            .with_context(|| format!("learning-curve arm {name}"))?;
+        let arm = run_learning_arm(
+            &arm_storage,
+            &corpus,
+            &cases,
+            cyc,
+            outcome,
+            name,
+            _harness_env.recall_read_only(),
+        )
+        .with_context(|| format!("learning-curve arm {name}"))?;
         arms.push(arm);
     }
 
@@ -2351,6 +4189,37 @@ fn category_name(c: SmokeCategory) -> &'static str {
         SmokeCategory::Negation => "negation",
         SmokeCategory::SingleHop => "single_hop",
         SmokeCategory::OpenDomain => "open_domain",
+        SmokeCategory::DirObject => "dir_object",
+        SmokeCategory::DirSubject => "dir_subject",
+        SmokeCategory::DirPassive => "dir_passive",
+    }
+}
+
+#[cfg(test)]
+mod ce_guard_tests {
+    use super::guard_cross_encoder_at;
+    use std::path::Path;
+
+    #[test]
+    fn a_missing_model_fails_the_arm_instead_of_measuring_baseline() {
+        // The whole point of the guard. recall() degrades to the unreranked
+        // ranking when the model is absent, so without this the arm COMPLETES,
+        // reports 0.0000, and that zero gets written down as "the reranker does
+        // nothing" instead of "the reranker never ran".
+        let err = guard_cross_encoder_at(true, Path::new("./models/does-not-exist"))
+            .expect_err("a CE arm without a CE model must refuse to run");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("silently fall back"),
+            "the error must say WHY a zero here would be a lie, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_missing_model_is_fine_when_no_arm_asked_for_it() {
+        // Ordinary runs must not be forced to provision 23 MB they never load.
+        guard_cross_encoder_at(false, Path::new("./models/does-not-exist"))
+            .expect("guard must be inert when the lever is off");
     }
 }
 
@@ -2358,10 +4227,147 @@ fn category_name(c: SmokeCategory) -> &'static str {
 mod tests {
     use super::*;
 
+    fn pool(ids: &[&str]) -> CaseRankList {
+        CaseRankList {
+            case_id: "conv-42_q17".to_string(),
+            retrieved: ids.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// The note has to place a divergence: on the scores when the pools agree,
+    /// on the pool otherwise, and nowhere when reranking was off.
+    #[test]
+    fn pool_divergence_note_locates_the_divergence() {
+        assert_eq!(pool_divergence_note(&pool(&[]), &pool(&["a"])), None);
+
+        let same = pool_divergence_note(&pool(&["a", "b", "c"]), &pool(&["a", "b", "c"]))
+            .expect("reranking was on");
+        assert!(same.starts_with(POOL_IDENTICAL), "{same}");
+        assert!(same.contains("reranker's scores"), "{same}");
+
+        let reordered = pool_divergence_note(&pool(&["a", "b", "c"]), &pool(&["a", "c", "b"]))
+            .expect("reranking was on");
+        assert!(reordered.contains("position 1"), "{reordered}");
+        assert!(
+            reordered.contains("only in repeat 0: [], only in the other: []"),
+            "same members in another order: {reordered}"
+        );
+
+        let swapped = pool_divergence_note(&pool(&["a", "b", "x"]), &pool(&["a", "b", "y"]))
+            .expect("reranking was on");
+        assert!(swapped.contains("position 2"), "{swapped}");
+        assert!(
+            swapped.contains(r#"only in repeat 0: ["x"], only in the other: ["y"]"#),
+            "{swapped}"
+        );
+    }
+
+    /// The leg note has to name the FIRST stage that differs, in pipeline
+    /// order, so a divergence is attributed to the leg it entered through and
+    /// not to the fusion that merely carried it.
+    #[test]
+    fn leg_divergence_note_names_the_first_differing_stage() {
+        let legs = |stages: &[(&str, Vec<&str>)]| -> Vec<(String, Vec<(String, Option<f32>)>)> {
+            stages
+                .iter()
+                .map(|(name, ids)| {
+                    (
+                        name.to_string(),
+                        ids.iter().map(|s| (s.to_string(), None)).collect(),
+                    )
+                })
+                .collect()
+        };
+
+        assert_eq!(
+            leg_divergence_note(&legs(&[]), &legs(&[("vector", vec!["a"])])),
+            None
+        );
+
+        let same = leg_divergence_note(
+            &legs(&[("graph", vec!["g"]), ("vector", vec!["a", "b"])]),
+            &legs(&[("graph", vec!["g"]), ("vector", vec!["a", "b"])]),
+        )
+        .expect("captured");
+        assert!(same.starts_with("every captured leg identical"), "{same}");
+        assert!(same.contains(r#"["graph", "vector"]"#), "{same}");
+
+        // Graph agrees, vector differs, fusion differs too: vector is named.
+        let located = leg_divergence_note(
+            &legs(&[
+                ("graph", vec!["g"]),
+                ("vector", vec!["a", "b", "x"]),
+                ("fusion", vec!["a", "x"]),
+            ]),
+            &legs(&[
+                ("graph", vec!["g"]),
+                ("vector", vec!["a", "b", "y"]),
+                ("fusion", vec!["a", "y"]),
+            ]),
+        )
+        .expect("captured");
+        assert!(
+            located.starts_with("first differing leg: vector"),
+            "{located}"
+        );
+        assert!(located.contains("position 2"), "{located}");
+        assert!(
+            located.contains(r#"only in repeat 0: ["x"], only in the other: ["y"]"#),
+            "{located}"
+        );
+
+        let reordered = leg_divergence_note(
+            &legs(&[("graph", vec!["g"]), ("vector", vec!["a", "b"])]),
+            &legs(&[("vector", vec!["a", "b"]), ("graph", vec!["g"])]),
+        )
+        .expect("captured");
+        assert!(
+            reordered.starts_with("stage sequence differs at index 0"),
+            "{reordered}"
+        );
+
+        // Same ids in the same order, one score changed: named as a score
+        // change, at its position, with both values.
+        let scored = |v: &[(&str, f32)]| -> Vec<(String, Vec<(String, Option<f32>)>)> {
+            vec![(
+                "vector".to_string(),
+                v.iter().map(|(id, s)| (id.to_string(), Some(*s))).collect(),
+            )]
+        };
+        let drifted = leg_divergence_note(
+            &scored(&[("a", 0.9), ("b", 0.5)]),
+            &scored(&[("a", 0.9), ("b", 0.25)]),
+        )
+        .expect("captured");
+        assert!(
+            drifted
+                .starts_with("first differing leg: vector — same 2 candidates in the same order"),
+            "{drifted}"
+        );
+        assert!(
+            drifted.contains("position 1: b scored Some(0.5)"),
+            "{drifted}"
+        );
+        assert!(drifted.contains("Some(0.25)"), "{drifted}");
+    }
+
     fn unique_storage_dir(label: &str) -> PathBuf {
         let id = Uuid::new_v4().simple().to_string();
         std::env::temp_dir().join(format!("shodh-recall-{label}-{id}"))
     }
+
+    // The harness's process-wide env mutation is contained by
+    // `pin_harness_threads` itself, which returns an RAII pin: it takes the
+    // crate-wide `RECALL_ENV_LOCK` and restores every variable it set on drop.
+    //
+    // This module used to carry a local `HarnessEnvGuard` that tests had to
+    // remember to acquire. It was the right diagnosis and the wrong location.
+    // `pin_harness_threads` then set `SHODH_ONNX_THREADS`, `RAYON_NUM_THREADS`,
+    // `SHODH_RECALL_READONLY` and `SHODH_EVAL_NOW` for the PROCESS; the local
+    // guard restored exactly one of them, so the frozen scoring clock leaked
+    // regardless — and any future test (or non-test caller) that forgot the
+    // guard leaked all four. Tests below bind the pin the same way the suite
+    // entry points do, and the lock is reentrant so nesting is safe.
 
     /// Lineage repro (substrate diagnosis 2026-06-10): root-cause P@1 has been
     /// 0.0 through every fix, and the instrumented CI run produced ZERO edge
@@ -2559,12 +4565,14 @@ mod tests {
     #[test]
     #[ignore = "training-data export — run explicitly"]
     fn export_fusion_training_data() {
+        let _harness_env = pin_harness_threads();
         let dir = unique_storage_dir("fusion-export");
         let out = dir.join("fusion_features.jsonl");
-        // SAFETY: process-wide env; run as a single explicit --ignored test.
-        unsafe {
-            std::env::set_var("SHODH_FUSION_FEATURE_EXPORT", &out);
-        }
+        let mut env = crate::test_support::ScopedEnv::acquire_recall();
+        env.set(
+            "SHODH_FUSION_FEATURE_EXPORT",
+            out.to_str().expect("export path is valid UTF-8"),
+        );
         let inputs = RunInputs {
             storage_path: dir.join("run"),
             corpus_path: Some(crate::recall_harness::fixtures::manifest_path(
@@ -2580,9 +4588,7 @@ mod tests {
             age_days: 0.0,
         };
         let report = run_smoke_suite_with_ranks(&inputs).expect("export run");
-        unsafe {
-            std::env::remove_var("SHODH_FUSION_FEATURE_EXPORT");
-        }
+        drop(env);
         let stable = std::path::Path::new("target/fusion_training.jsonl");
         std::fs::copy(&out, stable).expect("copy export");
         let lines = std::fs::read_to_string(stable).expect("read export");
@@ -2632,7 +4638,8 @@ mod tests {
         let gold_uuid = id_map.get("tw-gold").copied().expect("gold ingested");
 
         let system = manager.get_user_memory(EVAL_USER).expect("system");
-        std::env::set_var("SHODH_TYPED_WALK", "1");
+        let mut env = crate::test_support::ScopedEnv::acquire_recall();
+        env.set("SHODH_TYPED_WALK", "1");
         let results = system
             .read()
             .recall(&crate::memory::types::Query {
@@ -2642,7 +4649,7 @@ mod tests {
                 ..Default::default()
             })
             .expect("recall");
-        std::env::remove_var("SHODH_TYPED_WALK");
+        drop(env);
 
         let rank = results.iter().position(|m| m.id.0 == gold_uuid);
         assert!(
@@ -2665,6 +4672,7 @@ mod tests {
     /// root, ranked first.
     #[test]
     fn lineage_fragment_bridges_never_form() {
+        let _harness_env = pin_harness_threads();
         let dir = unique_storage_dir("lineage-flood-diag");
         let manager = build_manager(&dir).expect("manager");
         let chains = crate::recall_harness::multihop::DEFAULT_CHAINS;
@@ -2827,6 +4835,7 @@ mod tests {
 
     #[test]
     fn lineage_walk_survives_harness_scale() {
+        let _harness_env = pin_harness_threads();
         let dir = unique_storage_dir("lineage-scale");
         let manager = build_manager(&dir).expect("manager");
         let chains = crate::recall_harness::multihop::DEFAULT_CHAINS;
@@ -2893,6 +4902,7 @@ mod tests {
                     query_text: Some(case.query.clone()),
                     max_results: 10,
                     layers: *mode,
+                    read_only: _harness_env.recall_read_only(),
                     ..Default::default()
                 };
                 let _ = system.read().recall(&q);
@@ -2913,6 +4923,7 @@ mod tests {
             query_text: Some("What was the earliest origin behind the Selvic incident?".into()),
             max_results: 10,
             layers: LayerMode::Full,
+            read_only: _harness_env.recall_read_only(),
             ..Default::default()
         };
         let results = system.read().recall(&query).expect("recall");
@@ -2937,6 +4948,7 @@ mod tests {
     /// sequence or in the CI environment.
     #[test]
     fn lineage_harness_end_to_end_reproduces_ci() {
+        let _harness_env = pin_harness_threads();
         let dir = unique_storage_dir("lineage-harness-e2e");
         let inputs = RunInputs {
             storage_path: dir.clone(),
@@ -3114,6 +5126,7 @@ mod tests {
     /// captured by RH-6 baseline runs, not by unit tests.
     #[test]
     fn runner_executes_smoke_suite_and_produces_well_formed_report() {
+        let _harness_env = pin_harness_threads();
         let storage = unique_storage_dir("runner");
         let inputs = RunInputs {
             storage_path: storage.clone(),
@@ -3239,11 +5252,12 @@ mod tests {
         };
 
         let q = "What did Alice's collaborator discover?";
-        std::env::remove_var("SHODH_FUSION_V2");
+        let mut env = crate::test_support::ScopedEnv::acquire_recall();
+        env.remove("SHODH_FUSION_V2");
         let off = recall_order(q);
-        std::env::set_var("SHODH_FUSION_V2", "1");
+        env.set("SHODH_FUSION_V2", "1");
         let on = recall_order(q);
-        std::env::remove_var("SHODH_FUSION_V2");
+        drop(env);
         let _ = std::fs::remove_dir_all(&storage);
 
         let rank = |v: &Vec<(String, f32)>, id: &str| v.iter().position(|(i, _)| i == id);
@@ -3313,10 +5327,11 @@ mod tests {
                 .unwrap_or_default()
         };
 
-        std::env::set_var("SHODH_FUSION_V2", "1");
+        let mut env = crate::test_support::ScopedEnv::acquire_recall();
+        env.set("SHODH_FUSION_V2", "1");
         let pf = order(LayerMode::PlusFacts);
         let full = order(LayerMode::Full);
-        std::env::remove_var("SHODH_FUSION_V2");
+        drop(env);
         let _ = std::fs::remove_dir_all(&storage);
 
         let rank = |v: &Vec<String>, id: &str| v.iter().position(|i| i == id);
@@ -3327,6 +5342,48 @@ mod tests {
             rank(&pf, "person"),
             rank(&full, "person")
         );
+    }
+
+    #[test]
+    fn shard_windows_tile_the_manifest_exactly_once() {
+        // The property the sharded LongMemEval workflow depends on: with a fixed
+        // shard count and `per = ceil(len / shards)`, the windows are disjoint
+        // and cover every case exactly once. If this breaks, a suite total is
+        // silently computed over duplicated or skipped questions.
+        const SHARDS: usize = 10;
+        for len in [0usize, 1, 7, 9, 10, 11, 47, 50, 149, 150, 479] {
+            let per = len.div_ceil(SHARDS).max(1);
+            let mut covered = vec![0u32; len];
+            for shard in 0..SHARDS {
+                let (start, end) = shard_window(len, Some(shard * per), Some(per));
+                assert!(start <= end, "len={len} shard={shard}: inverted window");
+                assert!(end <= len, "len={len} shard={shard}: window past the end");
+                for slot in covered.iter_mut().take(end).skip(start) {
+                    *slot += 1;
+                }
+            }
+            assert!(
+                covered.iter().all(|&c| c == 1),
+                "len={len}: every case must be covered exactly once, got {covered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn out_of_range_shard_yields_an_empty_window_not_a_panic() {
+        // Routine, not exceptional: the shard count is fixed at 10 while the
+        // question total varies, so the tail shards fall off the end whenever
+        // the total is small.
+        assert_eq!(shard_window(5, Some(50), Some(5)), (5, 5));
+        assert_eq!(shard_window(0, Some(0), Some(5)), (0, 0));
+        assert_eq!(shard_window(5, Some(3), Some(99)), (3, 5));
+    }
+
+    #[test]
+    fn absent_offset_and_limit_select_the_whole_manifest() {
+        assert_eq!(shard_window(42, None, None), (0, 42));
+        assert_eq!(shard_window(42, None, Some(10)), (0, 10));
+        assert_eq!(shard_window(42, Some(10), None), (10, 42));
     }
 
     #[test]
@@ -3367,6 +5424,7 @@ mod tests {
     #[test]
     #[ignore = "expensive: runs the smoke suite twice (~12min). enable with --ignored before shipping harness changes."]
     fn runner_repeats_2_produces_same_quality_as_repeats_1() {
+        let _harness_env = pin_harness_threads();
         let storage1 = unique_storage_dir("repeats1");
         let storage2 = unique_storage_dir("repeats2");
 
@@ -3449,6 +5507,7 @@ mod tests {
     #[test]
     #[ignore = "expensive: runs the smoke suite with 6 modes (~6× query time). enable with --ignored before shipping layer-gate changes."]
     fn runner_layer_all_emits_six_modes_with_per_mode_determinism() {
+        let _harness_env = pin_harness_threads();
         let storage = unique_storage_dir("layer-all");
         let inputs = RunInputs {
             storage_path: storage.clone(),
@@ -3557,5 +5616,252 @@ mod tests {
             "failure must name the diverging case: {}",
             failures[0].detail
         );
+    }
+
+    /// The production typer, refusing the fallback. A test of what the graph
+    /// admits from NER output is void on the rule-based extractor, whose
+    /// "confidence" is a salience heuristic and not the sigmoid the floor in
+    /// `process_experience_into_graph` was written against.
+    fn production_ner(
+        manager: &MultiUserMemoryManager,
+    ) -> std::sync::Arc<crate::embeddings::ner::NeuralNer> {
+        let ner = manager.get_neural_ner();
+        assert!(
+            !ner.is_fallback_mode(),
+            "GLiNER assets missing — this test pins the PRODUCTION typer. Set \
+             SHODH_GLINER_MODEL_PATH to a directory holding model.onnx, tokenizer.json and \
+             label_embeddings.bin."
+        );
+        ner
+    }
+
+    /// Every entity surface the graph currently holds, lower-cased, with the
+    /// `source` attribute each phase stamps.
+    fn graph_surfaces(manager: &MultiUserMemoryManager) -> BTreeMap<String, String> {
+        let graph = manager.get_user_graph(EVAL_USER).expect("graph");
+        let g = graph.read();
+        g.get_all_entities()
+            .expect("entities")
+            .into_iter()
+            .map(|e| {
+                let source = e
+                    .attributes
+                    .get("source")
+                    .cloned()
+                    .unwrap_or_else(|| "-".to_string());
+                (e.name.to_lowercase(), source)
+            })
+            .collect()
+    }
+
+    /// A span the schema-driven typer committed is the first of the three
+    /// authorities `process_experience_into_graph` admits a node on ("the
+    /// schema-driven typer committed a span for it — the `ner_*` phases above,
+    /// which is where most real entities come from"). This pins that promise on
+    /// the production path the harness runs: NER → `remember` →
+    /// `process_experience_into_graph`, with the request's own tags declared
+    /// and nothing else.
+    ///
+    /// The directional corpus is the sharpest probe because its sentences name
+    /// people and nothing else: "Priya invited Caroline to the housewarming."
+    /// If a committed PER span does not become a node here, the graph leg has
+    /// no seed for any who-did-what-to-whom query, and the CI stage export
+    /// (run 36227833276: 160 memories, 40 people, 14 nodes) is the symptom.
+    #[test]
+    fn ner_committed_person_spans_become_graph_nodes() {
+        let _harness_env = pin_harness_threads();
+        let dir = unique_storage_dir("ner-person-nodes");
+        let manager = build_manager(&dir).expect("manager");
+        let ner = production_ner(&manager);
+
+        let corpus: Vec<CorpusItem> = fixtures::load_corpus(&fixtures::manifest_path(
+            "tests/recall/corpora/directional.jsonl",
+        ))
+        .expect("directional corpus")
+        .into_iter()
+        .take(4)
+        .collect();
+        assert_eq!(
+            corpus.len(),
+            4,
+            "directional corpus is shorter than expected"
+        );
+
+        // What the typer commits, recorded BEFORE ingest so the assertion is
+        // about admission and not about extraction.
+        let mut committed_people: BTreeMap<String, f32> = BTreeMap::new();
+        for item in &corpus {
+            for e in ner.extract(&item.content).expect("extract") {
+                if matches!(e.entity_type, crate::embeddings::ner::NerEntityType::Person) {
+                    let entry = committed_people.entry(e.text.to_lowercase()).or_insert(0.0);
+                    *entry = entry.max(e.confidence);
+                }
+            }
+        }
+        assert!(
+            !committed_people.is_empty(),
+            "the typer committed no PER span on four person-only sentences; the test cannot \
+             say anything about admission"
+        );
+
+        ingest_corpus(&manager, &corpus).expect("ingest");
+        let nodes = graph_surfaces(&manager);
+
+        let dropped: Vec<String> = committed_people
+            .iter()
+            .filter(|(surface, _)| !nodes.contains_key(surface.as_str()))
+            .map(|(surface, conf)| format!("{surface} (PER, conf {conf:.3})"))
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            dropped.is_empty(),
+            "{} of {} typer-committed PER spans never became graph nodes: {:?}. Graph holds {} \
+             nodes: {:?}. NER_GRAPH_CONFIDENCE_FLOOR = {}",
+            dropped.len(),
+            committed_people.len(),
+            dropped,
+            nodes.len(),
+            nodes,
+            crate::constants::NER_GRAPH_CONFIDENCE_FLOOR
+        );
+    }
+
+    /// Census: of the spans the production typer commits on a corpus, how many
+    /// become graph nodes, and where the rest fall against the graph-admission
+    /// confidence floor. Prints per corpus; asserts nothing beyond the typer
+    /// being live. Run explicitly:
+    ///   SHODH_MAX_CORPUS=50 cargo test --lib ner_span_to_node_census -- --ignored --nocapture
+    #[test]
+    #[ignore = "offline census over the fixture corpora — run explicitly"]
+    fn ner_span_to_node_census() {
+        let cap: usize = std::env::var("SHODH_MAX_CORPUS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50);
+        let corpora: [(&str, &str, usize); 2] = [
+            (
+                "directional",
+                "tests/recall/corpora/directional.jsonl",
+                usize::MAX,
+            ),
+            ("locomo-gate", "tests/recall/corpora/locomo-gate.jsonl", cap),
+        ];
+        let floor = crate::constants::NER_GRAPH_CONFIDENCE_FLOOR;
+        for (label, rel, take) in corpora {
+            let _harness_env = pin_harness_threads();
+            let dir = unique_storage_dir(&format!("ner-census-{label}"));
+            let manager = build_manager(&dir).expect("manager");
+            let ner = production_ner(&manager);
+            let corpus: Vec<CorpusItem> = fixtures::load_corpus(&fixtures::manifest_path(rel))
+                .expect("corpus")
+                .into_iter()
+                .take(take)
+                .collect();
+
+            // spans: every committed span; surfaces: distinct lower-cased text.
+            let mut spans = 0usize;
+            let mut spans_at_or_above_floor = 0usize;
+            let mut by_type: BTreeMap<&'static str, (usize, usize)> = BTreeMap::new();
+            let mut histogram = [0usize; 10];
+            let mut surfaces: BTreeMap<String, (f32, &'static str)> = BTreeMap::new();
+            let mut declared: HashSet<String> = HashSet::new();
+            for item in &corpus {
+                declared.extend(item.tags.iter().map(|t| t.to_lowercase()));
+                for e in ner.extract(&item.content).expect("extract") {
+                    spans += 1;
+                    let bucket = ((e.confidence * 10.0).floor() as usize).min(9);
+                    histogram[bucket] += 1;
+                    let slot = by_type.entry(e.entity_type.as_str()).or_insert((0, 0));
+                    slot.0 += 1;
+                    if e.confidence >= floor {
+                        spans_at_or_above_floor += 1;
+                        slot.1 += 1;
+                    }
+                    let entry = surfaces
+                        .entry(e.text.to_lowercase())
+                        .or_insert((0.0, e.entity_type.as_str()));
+                    entry.0 = entry.0.max(e.confidence);
+                }
+            }
+
+            ingest_corpus(&manager, &corpus).expect("ingest");
+            let nodes = graph_surfaces(&manager);
+            let edges = {
+                let graph = manager.get_user_graph(EVAL_USER).expect("graph");
+                let g = graph.read();
+                let edge_count = g.get_all_relationships().expect("relationships").len();
+                drop(g);
+                edge_count
+            };
+            let mut by_source: BTreeMap<&str, usize> = BTreeMap::new();
+            for source in nodes.values() {
+                *by_source.entry(source.as_str()).or_insert(0) += 1;
+            }
+            let surfaces_as_nodes = surfaces
+                .keys()
+                .filter(|s| nodes.contains_key(s.as_str()))
+                .count();
+            let surfaces_above_floor = surfaces.values().filter(|(c, _)| *c >= floor).count();
+            let surfaces_above_floor_as_nodes = surfaces
+                .iter()
+                .filter(|(s, (c, _))| *c >= floor && nodes.contains_key(s.as_str()))
+                .count();
+            let surfaces_below_floor_as_nodes: Vec<&String> = surfaces
+                .iter()
+                .filter(|(s, (c, _))| *c < floor && nodes.contains_key(s.as_str()))
+                .map(|(s, _)| s)
+                .collect();
+            let node_surfaces_not_from_ner: Vec<String> = nodes
+                .iter()
+                .filter(|(s, _)| !surfaces.contains_key(s.as_str()))
+                .map(|(s, src)| format!("{s}[{src}]"))
+                .collect();
+
+            println!("== {label}: {} memories, floor {floor}", corpus.len());
+            println!(
+                "   spans {spans} | >= floor {spans_at_or_above_floor} ({:.1}%) | by type \
+                 (all, >= floor) {by_type:?}",
+                100.0 * spans_at_or_above_floor as f64 / spans.max(1) as f64
+            );
+            println!("   confidence histogram [0.0-0.1 .. 0.9-1.0]: {histogram:?}");
+            println!(
+                "   distinct NER surfaces {} | >= floor {surfaces_above_floor} | became nodes \
+                 {surfaces_as_nodes} ({:.1}%) | >= floor AND node {surfaces_above_floor_as_nodes}",
+                surfaces.len(),
+                100.0 * surfaces_as_nodes as f64 / surfaces.len().max(1) as f64
+            );
+            println!(
+                "   below-floor surfaces that are nodes anyway (declared/tag-recognised): {:?}",
+                surfaces_below_floor_as_nodes
+            );
+            for ty in ["PER", "ORG", "LOC", "MISC"] {
+                let below: Vec<String> = surfaces
+                    .iter()
+                    .filter(|(_, (c, t))| *t == ty && *c < floor)
+                    .map(|(s, (c, _))| format!("{s}:{c:.2}"))
+                    .collect();
+                let above: Vec<String> = surfaces
+                    .iter()
+                    .filter(|(_, (c, t))| *t == ty && *c >= floor)
+                    .map(|(s, (c, _))| format!("{s}:{c:.2}"))
+                    .collect();
+                println!("   {ty}: {} surfaces below floor {below:?}", below.len());
+                println!("   {ty}: {} surfaces at/above floor {above:?}", above.len());
+            }
+            println!(
+                "   graph: {} nodes, {edges} edges, by source {by_source:?}; declared tag \
+                 surfaces {}",
+                nodes.len(),
+                declared.len()
+            );
+            println!("   nodes not from any NER surface: {node_surfaces_not_from_ner:?}");
+            if label == "directional" {
+                println!(
+                    "   directional nodes: {:?}",
+                    nodes.keys().collect::<Vec<_>>()
+                );
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

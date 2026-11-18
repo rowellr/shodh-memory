@@ -80,18 +80,18 @@ impl LazyModel {
         let builder = Session::builder()
             .context("Failed to create session builder")?
             .with_intra_threads(num_threads)
-            .context("Failed to set intra thread count")?
+            .map_err(|e| anyhow::anyhow!("Failed to set intra thread count: {e}"))?
             .with_inter_threads(1)
-            .context("Failed to set inter thread count")?;
+            .map_err(|e| anyhow::anyhow!("Failed to set inter thread count: {e}"))?;
 
         // Disable thread pool spinning to prevent Eigen spin-to-block deadlock
         // on macOS ARM64 heterogeneous cores (P-core/E-core architecture).
         // See: microsoft/onnxruntime#10270, pykeio/ort#516
-        let builder = builder
+        let mut builder = builder
             .with_intra_op_spinning(false)
-            .context("Failed to disable intra-op spinning")?
+            .map_err(|e| anyhow::anyhow!("Failed to disable intra-op spinning: {e}"))?
             .with_inter_op_spinning(false)
-            .context("Failed to disable inter-op spinning")?;
+            .map_err(|e| anyhow::anyhow!("Failed to disable inter-op spinning: {e}"))?;
 
         let session = builder
             .commit_from_file(&config.model_path)
@@ -536,6 +536,10 @@ impl MiniLMEmbedder {
         // past the tightest layer. Runs at construction (i.e. server startup)
         // even under lazy loading, so the failure is loud and immediate.
         Self::validate_sequence_contract(&config)?;
+        super::model_tape::register_model(
+            super::model_tape::Model::Embedder,
+            &[&config.model_path, &config.tokenizer_path],
+        );
 
         let (query_prefix, doc_prefix) = embedder_prefixes();
         let (native_hidden, dimension) = embedder_dims();
@@ -898,10 +902,12 @@ impl MiniLMEmbedder {
         tracing::debug!("ONNX: session lock acquired, tokenizing...");
 
         // Tokenize input text
+        let t_tokenize = crate::stage_probe::start();
         let encoding = model
             .tokenizer
             .encode(text, true)
             .map_err(|e| anyhow::anyhow!("Tokenization failed: {e}"))?;
+        crate::stage_probe::record(t_tokenize, |p, d| p.tokenize += d);
 
         let tokens = encoding.get_ids();
         let attention_mask = encoding.get_attention_mask();
@@ -933,8 +939,11 @@ impl MiniLMEmbedder {
             .iter()
             .any(|i| i.name() == "token_type_ids");
 
-        // Run inference
+        // Run inference. Timed in isolation: `session.run` is the only part of
+        // this function that hardware acceleration could move, so it must be
+        // separable from tokenization, tensor construction, and mean pooling.
         tracing::debug!("ONNX: running inference...");
+        let t_forward = crate::stage_probe::start();
         let outputs = if wants_token_type {
             session.run(ort::inputs![
                 "input_ids" => &input_ids_value,
@@ -947,6 +956,10 @@ impl MiniLMEmbedder {
                 "attention_mask" => &attention_mask_value,
             ])?
         };
+        crate::stage_probe::record(t_forward, |p, d| {
+            p.onnx_forward += d;
+            p.forwards += 1;
+        });
         tracing::debug!("ONNX: inference complete");
 
         // Extract embeddings
@@ -1133,6 +1146,13 @@ impl MiniLMEmbedder {
             &owned
         };
 
+        // A model tape, when one is in use, answers before either path below: replay
+        // must never reach a model or the simplified fallback, and recording must
+        // only ever keep a real model output.
+        if let Some(taped) = super::model_tape::embed(text, || self.generate_embedding_onnx(text)) {
+            return taped;
+        }
+
         // Use simplified mode if in that mode
         if self.simplified_mode {
             let start = std::time::Instant::now();
@@ -1253,6 +1273,24 @@ impl Embedder for MiniLMEmbedder {
         let empty_embedding = vec![0.0; self.dimension];
         if texts.iter().all(|t| t.is_empty()) {
             return Ok(vec![empty_embedding; texts.len()]);
+        }
+
+        // Under a model tape each text goes through `encode`, so it is keyed and
+        // replayed like any other. The batch path pads to its longest member, which
+        // would make a text's recorded vector depend on its neighbours. Batch
+        // encoding only runs in env-gated harness paths (entity-name embeddings,
+        // consolidation), so it is not what a recording is taken to measure.
+        if super::model_tape::active() {
+            return texts
+                .iter()
+                .map(|t| {
+                    if t.is_empty() {
+                        Ok(vec![0.0; self.dimension])
+                    } else {
+                        self.encode(t)
+                    }
+                })
+                .collect();
         }
 
         // Apply the document/passage instruction prefix to every non-empty text

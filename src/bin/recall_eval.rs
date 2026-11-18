@@ -21,7 +21,7 @@ use clap::{Parser, ValueEnum};
 use shodh_memory::memory::types::LayerMode;
 use shodh_memory::recall_harness::multihop::analyze_multihop;
 use shodh_memory::recall_harness::report::{
-    compare_to_baseline, AblationReport, BridgeReport, DecayReport, LearningCurveReport,
+    compare_to_baseline, AblationReport, BridgeReport, DecayReport, DeltaCi, LearningCurveReport,
     MultiHopReport, ReachabilityReport, Report, SelectiveForgettingReport,
 };
 use shodh_memory::recall_harness::runner::{
@@ -49,6 +49,9 @@ enum Suite {
     /// conversation's 629-turn corpus. The per-PR recall-regression gate that
     /// replaced the synthetic smoke suite. Fast (~1-2 min), real data.
     LocomoGate,
+    /// Who did what to whom: 240 questions over 60 pairs of role-swapped twin
+    /// memories with identical words. Chance is 50% p@1. Diagnostic, not gated.
+    Directional,
 }
 
 impl Suite {
@@ -57,6 +60,7 @@ impl Suite {
             Suite::Smoke => "smoke",
             Suite::Locomo => "locomo",
             Suite::LocomoGate => "locomo-gate",
+            Suite::Directional => "directional",
         }
     }
 
@@ -73,6 +77,10 @@ impl Suite {
             Suite::LocomoGate => Some((
                 fx::manifest_path(fx::LOCOMO_GATE_CORPUS_PATH),
                 fx::manifest_path(fx::LOCOMO_GATE_CASES_PATH),
+            )),
+            Suite::Directional => Some((
+                fx::manifest_path(fx::DIRECTIONAL_CORPUS_PATH),
+                fx::manifest_path(fx::DIRECTIONAL_CASES_PATH),
             )),
         }
     }
@@ -293,6 +301,14 @@ struct Args {
     #[arg(long)]
     longmemeval_limit: Option<usize>,
 
+    /// LongMemEval shard start: skip this many manifest questions before
+    /// applying `--longmemeval-limit`. Each question carries its own ~490-turn
+    /// haystack, so a full run cannot fit a single job's timeout; disjoint
+    /// (offset, limit) windows let parallel jobs cover the suite exactly once.
+    /// The manifest order is deterministic, so the windows are stable.
+    #[arg(long)]
+    longmemeval_offset: Option<usize>,
+
     /// Simulated edge age in days, applied AFTER ingest and BEFORE queries
     /// (decay study). When `> 0`, the harness ages the knowledge-graph edges via
     /// `simulate_edge_aging` at the production ~6h cadence, so recall quality is
@@ -420,11 +436,16 @@ fn run(args: &Args) -> Result<i32> {
         let report = shodh_memory::recall_harness::runner::run_longmemeval(
             lme_dir,
             &storage_path,
+            args.longmemeval_offset,
             args.longmemeval_limit,
             10,
             &layer_modes,
         )
         .context("LongMemEval run")?;
+        // Write the report so a sharded run can be recombined. Previously this
+        // path printed only, and `--output` was passed a file the run ignored.
+        std::fs::write(&args.output, serde_json::to_string_pretty(&report)?)
+            .with_context(|| format!("writing {}", args.output.display()))?;
         println!(
             "LongMemEval-S: {} questions (NER={}) — recall@{} = {:.4} — p@1 = {:.4}",
             report.questions, report.ner_backend, report.k, report.recall_at_k, report.p_at_1
@@ -832,6 +853,108 @@ fn summarise_reachability(report: &ReachabilityReport) {
             pct(c.cases_no_seed, c.cases),
         );
     }
+    // Substrate scoreboard. A typed path walk needs every hop to name a real
+    // relation; a hop through a symmetric type carries no order, so the typed
+    // share bounds what any composition scheme can express -- at a typed
+    // fraction p, a fully-typed k-hop path is about p^k.
+    let gs = &report.graph;
+    let stored = gs.typed_edges + gs.symmetric_edges;
+    if stored > 0 {
+        eprintln!(
+            "  relation substrate: {} stored edges, {} typed ({:.2}%), {} symmetric ({:.2}%)",
+            stored,
+            gs.typed_edges,
+            pct(gs.typed_edges, stored),
+            gs.symmetric_edges,
+            pct(gs.symmetric_edges, stored),
+        );
+        let p = gs.typed_edges as f64 / stored as f64;
+        eprintln!(
+            "  fully-typed path share: 2-hop ~{:.2}%, 3-hop ~{:.3}%  (p^k at p={:.4})",
+            100.0 * p * p,
+            100.0 * p * p * p,
+            p
+        );
+        // Entity labels. A label-pair typing rule that never matches is
+        // indistinguishable from one that does nothing, unless you can see this.
+        let mut labels: Vec<(&String, &usize)> = gs.entity_labels.iter().collect();
+        labels.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        let shown: Vec<String> = labels
+            .iter()
+            .take(8)
+            .map(|(name, n)| format!("{name}={n}"))
+            .collect();
+        eprintln!("  entity labels: {}", shown.join("  "));
+
+        // Which labels carry the connectivity. `entity labels` above says what
+        // EXISTS; a label that is a small share of nodes and a large share of
+        // incidences is a node type doing an attribute's job, and that is a
+        // construction decision rather than an extraction result.
+        //
+        // Denominator is total incidences (2x edges). Multi-label entities are
+        // counted under each label, so these shares can sum past 100% -- read
+        // each against that label's ENTITY share, not against the others.
+        let incidences = gs.total_edges * 2;
+        if incidences > 0 && !gs.label_degrees.is_empty() {
+            let mut census: Vec<(&String, &(usize, usize, usize))> =
+                gs.label_degrees.iter().collect();
+            census.sort_by(|a, b| b.1 .1.cmp(&a.1 .1).then_with(|| a.0.cmp(b.0)));
+            eprintln!("  degree census by label (entity share -> incidence share):");
+            for (name, (n, sum, max)) in census.iter().take(10) {
+                let ent_share = 100.0 * *n as f64 / gs.total_entities.max(1) as f64;
+                let inc_share = 100.0 * *sum as f64 / incidences as f64;
+                eprintln!(
+                    "    {name:<14} {n:>4} ent ({ent_share:>5.1}%) -> {sum:>6} inc ({inc_share:>5.1}%)                       mean {:>5.1}  max {max}",
+                    *sum as f64 / (*n).max(1) as f64,
+                );
+            }
+        }
+
+        // Identities. Aggregates hide hubs, and per-label mean degree
+        // understates them because degrees are post-cap. A degree sitting
+        // exactly on the cap is the tell: its overflow was discarded at ingest.
+        if !gs.top_hubs.is_empty() {
+            eprintln!(
+                "  top hubs by degree (post-cap; a degree at the cap means edges were dropped):"
+            );
+            for (name, labels, degree) in gs.top_hubs.iter().take(15) {
+                let short: String = name.chars().take(38).collect();
+                eprintln!("    {degree:>5}  {short:<38}  {labels}");
+            }
+        }
+
+        // Connectivity. A k-connected graph survives k-1 vertex deletions; if
+        // this shatters after a handful, connectivity is HUB-CARRIED and a high
+        // edge count was never high connectivity.
+        eprintln!(
+            "  components: {} (largest {:.1}% of entities)",
+            gs.components_all.0,
+            100.0 * gs.components_all.1
+        );
+        for (k, count, largest) in &gs.components_after_hub_removal {
+            eprintln!(
+                "    after removing top-{k:<3} hubs: {count:>5} components, largest {:.1}%",
+                100.0 * largest
+            );
+        }
+        eprintln!(
+            "  TYPED-only subgraph: {} components, largest {:.1}%, {} entities isolated ({:.1}%)",
+            gs.typed_components.0,
+            100.0 * gs.typed_components.1,
+            gs.typed_components.2,
+            100.0 * gs.typed_components.2 as f64 / gs.total_entities.max(1) as f64,
+        );
+        eprintln!("  (isolated-in-typed is the ceiling on what a grammar-guided walk can reach)");
+
+        let mut by_count: Vec<(&String, &usize)> = gs.relation_types.iter().collect();
+        by_count.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        let top: Vec<String> = by_count
+            .iter()
+            .take(8)
+            .map(|(name, n)| format!("{name}={n}"))
+            .collect();
+        eprintln!("  relation types: {}", top.join("  "));
+    }
     eprintln!("  ≤2hop% is the canonical double-hop signal: high => graph-native fixes can lift multi_hop;");
     eprintln!("  low + high unreach% => gold has no associative path (extraction/construction gap or non-entity hop).");
 }
@@ -900,14 +1023,11 @@ fn write_ablation(path: &std::path::Path, report: &AblationReport) -> Result<()>
     Ok(())
 }
 
-/// Print the ablation matrix as a markdown table (Δ recall@10 vs the row named
-/// `baseline`), so it can be pasted straight into the study doc.
+/// Print the ablation matrix as a markdown table, so it can be pasted straight
+/// into the study doc. Each delta is paired against the arm's own reference, with
+/// a 95% bootstrap interval over cases; `*` marks an interval that excludes zero,
+/// and a delta without one is not distinguishable from no effect at this size.
 fn summarise_ablation(report: &AblationReport) {
-    let base = report
-        .rows
-        .iter()
-        .find(|r| r.name.starts_with("baseline"))
-        .map(|r| r.recall_at_10);
     eprintln!(
         "recall-eval: ablation (suite={} cases={} sha={})",
         report.suite, report.case_count, report.git_sha
@@ -916,17 +1036,45 @@ fn summarise_ablation(report: &AblationReport) {
         "## Ablation matrix ({} suite, {} cases)\n",
         report.suite, report.case_count
     );
-    println!("| config | recall@10 | Δ vs base | ndcg@10 | mrr | p@1 |");
-    println!("| --- | --- | --- | --- | --- | --- |");
+    println!(
+        "Δ is paired against the reference arm, [lo, hi] is a 95% bootstrap interval \
+         over cases, `*` = the interval excludes 0. VACUOUS = byte-identical retrieval \
+         to the reference, so the arm's flags never reached their code path.\n"
+    );
+    println!(
+        "| config | reference | recall@10 | Δ recall@10 [95% CI] | p@1 | Δ p@1 [95% CI] | ndcg@10 | mrr |"
+    );
+    println!("| --- | --- | --- | --- | --- | --- | --- | --- |");
     for r in &report.rows {
-        let delta = match base {
-            Some(b) => format!("{:+.4}", r.recall_at_10 - b),
-            None => String::new(),
+        let name = if r.vacuous_vs_reference {
+            format!("{} (VACUOUS)", r.name)
+        } else {
+            r.name.clone()
         };
         println!(
-            "| {} | {:.4} | {} | {:.4} | {:.4} | {:.4} |",
-            r.name, r.recall_at_10, delta, r.ndcg_at_10, r.mrr, r.p_at_1
+            "| {} | {} | {:.4} | {} | {:.4} | {} | {:.4} | {:.4} |",
+            name,
+            r.reference.as_deref().unwrap_or("—"),
+            r.recall_at_10,
+            format_delta(r.delta_recall_at_10),
+            r.p_at_1,
+            format_delta(r.delta_p_at_1),
+            r.ndcg_at_10,
+            r.mrr
         );
+    }
+    match report.baseline_replicate_identical {
+        Some(true) => println!(
+            "\nBaseline replicate (re-run after every arm, same ingest): **identical** to \
+             the first pass. No arm left state behind, and query-time retrieval is \
+             deterministic on this ingest."
+        ),
+        Some(false) => println!(
+            "\nBaseline replicate (re-run after every arm, same ingest): **DIFFERS** from \
+             the first pass. Either an arm left state behind or query-time retrieval is not \
+             deterministic on a fixed ingest; read every delta above with that noise in mind."
+        ),
+        None => {}
     }
     // Per-category recall, transposed (category × config), surfaces a config that
     // trades one capability for another.
@@ -953,6 +1101,20 @@ fn summarise_ablation(report: &AblationReport) {
                 .collect();
             println!("| {} | {} |", cat, cells.join(" | "));
         }
+    }
+}
+
+/// `+0.0123 [+0.0040, +0.0210] *` for a paired delta, empty for the baseline.
+fn format_delta(delta: Option<DeltaCi>) -> String {
+    match delta {
+        Some(d) => format!(
+            "{:+.4} [{:+.4}, {:+.4}]{}",
+            d.mean,
+            d.lo,
+            d.hi,
+            if d.excludes_zero() { " *" } else { "" }
+        ),
+        None => String::new(),
     }
 }
 
@@ -1071,6 +1233,21 @@ fn summarise(report: &Report) {
         "recall-eval: suite={} cases={} repeats={} embedder={} sha={}",
         report.suite, report.case_count, report.repeats, report.embedder, report.git_sha
     );
+    eprintln!(
+        "recall-eval: kernel_class={} cpu={:?} features={}",
+        report.kernel.class,
+        report.kernel.cpu_model,
+        report.kernel.features.join(",")
+    );
+    match report.rerank {
+        Some(r) if r.enabled => eprintln!("recall-eval: rerank=cross-encoder depth={}", r.depth),
+        Some(_) => eprintln!("recall-eval: rerank=off"),
+        None => eprintln!("recall-eval: rerank=<not recorded>"),
+    }
+    match &report.model_tape {
+        Some(d) => eprintln!("recall-eval: model outputs replayed from tape {d}"),
+        None => eprintln!("recall-eval: model outputs computed live"),
+    }
     // Print modes in pipeline order (vamana_only → full), not BTreeMap order.
     // Match against the canonical mode keys so any unknown key just falls
     // through to the BTreeMap iteration at the bottom.
@@ -1085,8 +1262,14 @@ fn summarise(report: &Report) {
     for name in mode_order {
         if let Some(layer) = report.layers.get(name) {
             eprintln!(
-                "  {:<12} ndcg@10={:.4} recall@10={:.4} mrr={:.4} p@1={:.4} map={:.4}",
-                name, layer.ndcg_at_10, layer.recall_at_10, layer.mrr, layer.p_at_1, layer.map
+                "  {:<12} ndcg@10={:.4} recall@10={:.4} hit@10={:.4} mrr={:.4} p@1={:.4} map={:.4}",
+                name,
+                layer.ndcg_at_10,
+                layer.recall_at_10,
+                layer.hit_at_10,
+                layer.mrr,
+                layer.p_at_1,
+                layer.map
             );
         }
     }

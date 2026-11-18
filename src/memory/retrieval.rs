@@ -47,6 +47,11 @@ const VAMANA_INDEX_FILE: &str = "vamana.idx";
 /// **Note:** Memory graph (Hebbian learning) has been consolidated into GraphMemory
 /// which is managed at the API layer (MultiUserMemoryManager.graph_memories)
 pub struct RetrievalEngine {
+    /// Vector index inserts that failed. A nonzero count means memories are
+    /// STORED BUT SEMANTICALLY UNREACHABLE — the orphan condition the startup
+    /// recovery repairs, counted while it accumulates rather than only after a
+    /// restart notices it.
+    index_failures: std::sync::atomic::AtomicU64,
     storage: Arc<MemoryStorage>,
     embedder: Arc<MiniLMEmbedder>,
     /// Lock order: 1 - Acquire first
@@ -203,6 +208,7 @@ impl RetrievalEngine {
         // This enables persistent storage in RocksDB with proper Hebbian learning
 
         let engine = Self {
+            index_failures: std::sync::atomic::AtomicU64::new(0),
             storage,
             embedder,
             vector_index: Arc::new(RwLock::new(vector_index)),
@@ -634,6 +640,17 @@ impl RetrievalEngine {
             .collect()
     }
 
+    /// Vector index inserts lost since process start. Nonzero means memories
+    /// exist in the primary store that no semantic query can reach.
+    ///
+    /// Covers `index_memory` and `reindex_memory` (which delegates to it). The
+    /// startup migration and orphan-recovery paths call `add_vector` directly
+    /// and are not counted here.
+    pub fn index_failure_count(&self) -> u64 {
+        self.index_failures
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Add memory to vector index with atomic RocksDB storage
     ///
     /// ATOMIC ARCHITECTURE: This method stores the vector mapping atomically
@@ -644,6 +661,18 @@ impl RetrievalEngine {
     /// embeddings to ensure ALL content is searchable — not just the tokens
     /// that survive truncation.
     pub fn index_memory(&self, memory: &Memory) -> Result<()> {
+        // Counted at the boundary, not at the call sites that log and continue.
+        match self.index_memory_inner(memory) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.index_failures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err(e)
+            }
+        }
+    }
+
+    fn index_memory_inner(&self, memory: &Memory) -> Result<()> {
         use crate::embeddings::chunking::{chunk_text, ChunkConfig};
 
         let text = Self::extract_searchable_text(memory);
@@ -954,18 +983,40 @@ impl RetrievalEngine {
         }
 
         // Convert to vec and sort by similarity descending (highest first).
-        // Tie-break by MemoryId for deterministic rank order across runs/CPUs.
-        // (created_at is unavailable here — we only have ids + scores.)
+        // This order is then TRUNCATED, so it decides membership, not just
+        // rank. Equal similarities are ordered by content, a key the corpus
+        // determines; the MemoryId is a per-ingest uuid and only separates
+        // byte-identical texts. Content is fetched only inside a tied run.
         let mut memory_ids: Vec<(MemoryId, f32)> = best_scores.into_iter().collect();
         memory_ids.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        crate::memory::order_ties_by_content(
+            &mut memory_ids,
+            |a, b| a.1.to_bits() == b.1.to_bits(),
+            |x| x.0.clone(),
+            |id| self.storage.get(id).ok().map(|m| m.experience.content),
+        );
         memory_ids.truncate(limit);
 
         Ok(memory_ids)
     }
 
-    /// Get memory from storage by ID
+    /// Get memory from storage by ID, where a missing memory is an error.
+    ///
+    /// Use this only where the record IS the answer. Scanning callers — the
+    /// ones that would react to a failure by discarding their pointer to the
+    /// memory — must use [`Self::get_from_storage_opt`].
     pub fn get_from_storage(&self, id: &MemoryId) -> Result<Memory> {
         self.storage.get(id)
+    }
+
+    /// Get memory from storage by ID, telling absence apart from a failed read.
+    ///
+    /// `Ok(None)` means RocksDB positively reported no value at the key — the
+    /// only outcome that justifies removing this memory's index entry (see
+    /// [`MemoryStorage::get_opt`]). `Err` means the read was inconclusive: the
+    /// record may still be there, so nothing pointing at it may be deleted.
+    pub fn get_from_storage_opt(&self, id: &MemoryId) -> Result<Option<Memory>> {
+        self.storage.get_opt(id)
     }
 
     /// Search for similar memories by embedding directly (SHO-106)

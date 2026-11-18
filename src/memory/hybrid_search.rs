@@ -15,16 +15,18 @@
 //! ```
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
-use tantivy::schema::{Field, Schema, Value, STORED, STRING, TEXT};
-use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument};
+use tantivy::query::{Query, QueryParser};
+use tantivy::schema::{
+    Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, STORED, STRING, TEXT,
+};
+use tantivy::{DocAddress, Index, IndexReader, IndexWriter, Score, Searcher, TantivyDocument};
 use tracing::{debug, info};
 
 use super::types::MemoryId;
@@ -148,26 +150,166 @@ pub struct BM25Index {
     /// real-time scans) intermittently locking freshly written segment
     /// files, which made eval rankings depend on ambient machine state.
     commit_failures: std::sync::atomic::AtomicU64,
+
+    /// Document inserts that failed. A nonzero count means memories are
+    /// STORED BUT LEXICALLY UNREACHABLE — present in the primary store,
+    /// findable by no BM25 query — which is a different loss from
+    /// `commit_failures`, where the document reached the writer and the batch
+    /// did not reach disk. Both are handled-and-continued by all fifteen index
+    /// sites in `memory/mod.rs` — thirteen `index_memory` (eleven `if let
+    /// Err`, two `match`) plus two `reindex_memory`, none propagating — which
+    /// is right for availability and invisible to a measurement that needs its
+    /// corpus whole.
+    ///
+    /// Narrow on this side by nature: `add_document` buffers and errors only
+    /// once the writer is dead. `MemorySystem::index_coverage` is what catches
+    /// a loss that never errored at all.
+    index_failures: std::sync::atomic::AtomicU64,
+
+    /// Exists while a backfill is in flight. See [`BM25Index::backfill_pending`].
+    backfill_marker: PathBuf,
+}
+
+/// Tantivy analyzer that lowercases and applies the English (Snowball) stemmer.
+///
+/// Registered by `TokenizerManager::default()` under tantivy's `stemmer`
+/// feature, which is in tantivy's default feature set; this crate depends on
+/// `tantivy = "0.26"` with defaults enabled.
+const STEMMED_TOKENIZER: &str = "en_stem";
+
+/// The schema this binary indexes and queries with.
+///
+/// `content` and `tags` are stemmed; `entities` deliberately is not.
+///
+/// `TEXT` binds tantivy's `default` analyzer (`SimpleTokenizer +
+/// RemoveLongFilter + LowerCaser`), which cannot match a query to an inflected
+/// form of the same word. In the recall corpus the query word "letters" occurs
+/// in no document at all, while seven share its stem, so for `conv-42_q62`
+/// ("How many letters has Joanna recieved?") an offline BM25 over the 5,882
+/// documents ranks the two gold documents 562nd and 271st unstemmed and 9th
+/// and 1st stemmed. Every other
+/// stemmed surface in the codebase (the entity index in `graph_memory`, the
+/// query parser, compression, temporal facts) already stems; BM25 was the
+/// holdout.
+///
+/// `entities` holds proper nouns, and stemming them would re-create the
+/// collision `GraphMemory` keeps proper nouns out of its stemmed index to avoid
+/// ("Paris" → "pari" merging with "Parison"). Tantivy analyzes a query per field
+/// with that field's own analyzer, so a term stems against `content` and stays
+/// literal against `entities`.
+fn build_schema() -> Schema {
+    let stemmed = TextOptions::default().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_tokenizer(STEMMED_TOKENIZER)
+            // Phrase queries (`search_with_term_and_phrase_weights`) need positions.
+            .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+    );
+
+    let mut schema_builder = Schema::builder();
+
+    // Memory ID (stored, not tokenized)
+    schema_builder.add_text_field("id", STRING | STORED);
+
+    // Main content (tokenized + stemmed for BM25)
+    schema_builder.add_text_field("content", stemmed.clone() | STORED);
+
+    // Tags (tokenized + stemmed: lowercase common nouns, low proper-noun risk)
+    schema_builder.add_text_field("tags", stemmed);
+
+    // Entities (tokenized, not stemmed; see above)
+    schema_builder.add_text_field("entities", TEXT);
+
+    schema_builder.build()
+}
+
+/// The top `limit` hits of `query`, plus every hit that ties with the last of
+/// them, so the caller can cut that tie by a key the corpus determines.
+///
+/// `TopDocs` breaks equal scores by ascending `DocAddress`, and the segment
+/// ordinal inside a `DocAddress` is the segment's position in `meta.json`,
+/// which tantivy writes from a `HashMap` of segment ids. So two indexes built
+/// from one corpus, with one document per commit as `remember` does it, put
+/// the same tied documents in different orders, and a cut at `limit` through
+/// a tie keeps a different subset each time. BM25 ties are not rare: every
+/// document that matches the same query terms with the same frequencies and
+/// the same (quantised) length scores bit-identically, whatever segment holds
+/// it, because the corpus statistics are summed over the whole searcher.
+///
+/// Fetching twice the limit covers the tie in one search in the ordinary
+/// case; when the tie still runs past the window the window doubles, bounded
+/// by the number of live documents, so no match on the boundary score is ever
+/// left out of the caller's cut.
+fn collect_top_with_stable_ties(
+    searcher: &Searcher,
+    query: &dyn Query,
+    limit: usize,
+) -> Result<Vec<(Score, DocAddress)>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let live_docs = searcher.num_docs() as usize;
+    let mut window = limit.saturating_mul(2);
+    let mut hits = loop {
+        let hits = searcher
+            .search(query, &TopDocs::with_limit(window).order_by_score())
+            .context("BM25 search failed")?;
+        // Fewer than asked for: every match is in hand.
+        if hits.len() < window {
+            break hits;
+        }
+        let boundary = hits[limit - 1].0;
+        let last = hits[window - 1].0;
+        if last.total_cmp(&boundary).is_lt() || window >= live_docs {
+            break hits;
+        }
+        window = window.saturating_mul(2).min(live_docs);
+    };
+    // Only the boundary's plateau can change the cut. Everything below it is
+    // dropped here, before the caller pays a document fetch for it.
+    if hits.len() > limit {
+        let boundary = hits[limit - 1].0;
+        let keep = hits
+            .iter()
+            .position(|(score, _)| score.total_cmp(&boundary).is_lt())
+            .unwrap_or(hits.len());
+        hits.truncate(keep);
+    }
+    Ok(hits)
+}
+
+/// Total order for BM25 hits: score, then content, then id.
+///
+/// Content is what makes the order a function of the corpus rather than of
+/// the index layout. The id is a per-ingest v4 uuid and only separates two
+/// documents with identical text, which no lexical key can tell apart.
+fn order_hits_by_score_then_content(hits: &mut [(MemoryId, f32, String)]) {
+    hits.sort_by(|a, b| {
+        b.1.total_cmp(&a.1)
+            .then_with(|| a.2.cmp(&b.2))
+            .then_with(|| a.0.cmp(&b.0))
+    });
 }
 
 impl BM25Index {
-    /// Create or open a BM25 index at the given path
+    /// Create or open a BM25 index at the given path.
+    ///
+    /// # Schema migration
+    ///
+    /// An on-disk index carries its own schema, including each field's
+    /// tokenizer name, in `meta.json`, and `Index::open` takes no schema: it
+    /// rebuilds everything from that file and ignores the one built here. The
+    /// writer and the `QueryParser` then resolve analyzers from the opened
+    /// index, so an index created before an analyzer change would keep indexing
+    /// and querying with the old one indefinitely, with no error, answering
+    /// differently from a fresh install of the same binary.
+    ///
+    /// So the schema is compared on open, and a mismatch rebuilds: the stale
+    /// directory is deleted and recreated empty, which makes
+    /// [`HybridSearchEngine::needs_backfill`] true and lets the startup
+    /// backfill repopulate it from RocksDB, the path a fresh install takes. The
+    /// index is derived data; RocksDB holds every document it contained.
     pub fn new(path: &Path) -> Result<Self> {
-        let mut schema_builder = Schema::builder();
-
-        // Memory ID (stored, not tokenized)
-        schema_builder.add_text_field("id", STRING | STORED);
-
-        // Main content (tokenized for BM25)
-        schema_builder.add_text_field("content", TEXT | STORED);
-
-        // Tags (tokenized)
-        schema_builder.add_text_field("tags", TEXT);
-
-        // Entities (tokenized)
-        schema_builder.add_text_field("entities", TEXT);
-
-        let schema = schema_builder.build();
+        let schema = build_schema();
 
         // Create or open index
         std::fs::create_dir_all(path)?;
@@ -175,7 +317,27 @@ impl BM25Index {
             .context("Failed to open tantivy directory")?;
 
         let index = if Index::exists(&dir)? {
-            Index::open(dir).context("Failed to open existing BM25 index")?
+            let existing = Index::open(dir).context("Failed to open existing BM25 index")?;
+            if existing.schema() == schema {
+                existing
+            } else {
+                // Every handle onto the directory must be gone before removing
+                // it: on Windows the mmapped segment files stay open until this
+                // value is dropped, and `remove_dir_all` fails with a sharing
+                // violation.
+                drop(existing);
+                tracing::warn!(
+                    "BM25 index at {:?} was built with a different schema (analyzer or \
+                     field change); discarding it and rebuilding from long-term storage. \
+                     Lexical search is incomplete until the backfill finishes.",
+                    path
+                );
+                std::fs::remove_dir_all(path)
+                    .with_context(|| format!("Failed to remove stale BM25 index at {path:?}"))?;
+                std::fs::create_dir_all(path)?;
+                Index::create_in_dir(path, schema)
+                    .context("Failed to recreate BM25 index after schema change")?
+            }
         } else {
             Index::create_in_dir(path, schema).context("Failed to create BM25 index")?
         };
@@ -219,7 +381,38 @@ impl BM25Index {
             tags_field,
             entities_field,
             commit_failures: std::sync::atomic::AtomicU64::new(0),
+            index_failures: std::sync::atomic::AtomicU64::new(0),
+            backfill_marker: path.with_extension("backfill-pending"),
         })
+    }
+
+    /// Whether a backfill started and did not finish.
+    ///
+    /// `is_empty` alone cannot say that: a backfill interrupted after its first
+    /// batch commit leaves an index that is non-empty and incomplete, and from
+    /// then on nothing refills it, so the memories past the interruption are
+    /// stored and lexically unreachable for good. The schema migration in
+    /// [`BM25Index::new`] sends every existing index through a backfill once,
+    /// which turns that from a rare crash window into one every upgrade crosses.
+    /// The marker is a sibling of the index directory, not a file inside it, so
+    /// tantivy's directory management never sees it.
+    pub fn backfill_pending(&self) -> bool {
+        self.backfill_marker.exists()
+    }
+
+    fn begin_backfill(&self) -> Result<()> {
+        std::fs::write(&self.backfill_marker, b"")
+            .with_context(|| format!("Failed to write {:?}", self.backfill_marker))
+    }
+
+    fn finish_backfill(&self) -> Result<()> {
+        match std::fs::remove_file(&self.backfill_marker) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => {
+                Err(e).with_context(|| format!("Failed to remove {:?}", self.backfill_marker))
+            }
+        }
     }
 
     /// Add or update a document in the index
@@ -243,7 +436,13 @@ impl BM25Index {
         doc.add_text(self.tags_field, tags.join(" "));
         doc.add_text(self.entities_field, entities.join(" "));
 
-        writer.add_document(doc)?;
+        // Counted HERE rather than at the fifteen index sites that log and
+        // continue, so a caller added later cannot forget to record its loss.
+        if let Err(e) = writer.add_document(doc) {
+            self.index_failures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(e.into());
+        }
 
         Ok(())
     }
@@ -297,6 +496,13 @@ impl BM25Index {
     /// the searchable index is missing documents.
     pub fn commit_failure_count(&self) -> u64 {
         self.commit_failures
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Number of document inserts lost. Nonzero means memories exist in the
+    /// primary store that no lexical query can reach.
+    pub fn index_failure_count(&self) -> u64 {
+        self.index_failures
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -419,25 +625,31 @@ impl BM25Index {
             }
         };
 
-        let top_docs = searcher
-            .search(&parsed_query, &TopDocs::with_limit(limit).order_by_score())
-            .context("BM25 search failed")?;
+        let top_docs = collect_top_with_stable_ties(&searcher, &parsed_query, limit)?;
 
-        let mut results = Vec::with_capacity(top_docs.len());
-
+        let mut hits: Vec<(MemoryId, f32, String)> = Vec::with_capacity(top_docs.len());
         for (score, doc_address) in top_docs {
-            if let Ok(doc) = searcher.doc::<TantivyDocument>(doc_address) {
-                if let Some(id_value) = doc.get_first(self.id_field) {
-                    if let Some(id_str) = id_value.as_str() {
-                        if let Ok(uuid) = uuid::Uuid::parse_str(id_str) {
-                            results.push((MemoryId(uuid), score));
-                        }
-                    }
-                }
-            }
+            let Ok(doc) = searcher.doc::<TantivyDocument>(doc_address) else {
+                continue;
+            };
+            let Some(uuid) = doc
+                .get_first(self.id_field)
+                .and_then(|v| v.as_str())
+                .and_then(|s| uuid::Uuid::parse_str(s).ok())
+            else {
+                continue;
+            };
+            let content = doc
+                .get_first(self.content_field)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            hits.push((MemoryId(uuid), score, content));
         }
+        order_hits_by_score_then_content(&mut hits);
+        hits.truncate(limit);
 
-        Ok(results)
+        Ok(hits.into_iter().map(|(id, score, _)| (id, score)).collect())
     }
 
     /// Get document count
@@ -554,7 +766,15 @@ impl RRFusion {
     ///
     /// Each input is a Vec of (MemoryId, score) sorted by score descending.
     /// Returns fused (MemoryId, rrf_score) sorted by rrf_score descending.
-    pub fn fuse(&self, ranked_lists: Vec<Vec<(MemoryId, f32)>>) -> Vec<(MemoryId, f32)> {
+    ///
+    /// `get_content` resolves a memory's text and is consulted only inside a
+    /// run of equal RRF scores; see the tie-break note below for why the
+    /// order of such a run has to come from the corpus.
+    pub fn fuse(
+        &self,
+        ranked_lists: Vec<Vec<(MemoryId, f32)>>,
+        get_content: impl Fn(&MemoryId) -> Option<String>,
+    ) -> Vec<(MemoryId, f32)> {
         let mut scores: HashMap<MemoryId, f32> = HashMap::new();
         let mut original_scores: HashMap<MemoryId, Vec<Option<f32>>> = HashMap::new();
 
@@ -578,17 +798,34 @@ impl RRFusion {
             }
         }
 
-        // Sort by RRF score descending, with a deterministic MemoryId tie-break.
-        // RRF scores collide constantly by construction (any two docs at the
-        // same rank in their respective lists contribute identical amounts), and
-        // `scores` is a HashMap whose iteration order is randomized per process.
-        // Without the tie-break, equal-scored candidates are ordered arbitrarily
-        // and differently across runs, which propagates into the downstream
-        // rank-based fusion (mod.rs Layer 4) and can flip candidates in/out of
-        // the truncated top-k between identical queries. Every other sort in the
-        // pipeline already tie-breaks on MemoryId; this was the lone exception.
+        // Sort by RRF score descending. RRF scores collide by construction:
+        // any two candidates at the same rank in their respective lists
+        // contribute identical amounts, so equal scores are routine, and
+        // `scores` is a HashMap whose iteration order is random per process.
+        //
+        // Equal scores used to be ordered by MemoryId. That is total and
+        // repeatable within one store, but a MemoryId is a v4 uuid drawn at
+        // ingest, so two ingests of the same corpus put the same tied pair in
+        // either order (the L1 gate saw the hybrid leg with identical members
+        // in a different order from position 43, conv-42_q17). Content is a
+        // pure function of the corpus, so a run of equal scores is ordered by
+        // it; the id then only separates byte-identical texts, where either
+        // order is equivalent. The lookup runs only inside runs of two or more.
+        //
+        // Cost, settled: with the live weights (0.35/0.40) and k = 45, at most
+        // eight (bm25 rank, vector rank) pairs can tie exactly in f32 for one
+        // query, so this is at most ~16 lazy storage reads. The gate's
+        // per-stage timing with this in place put the whole fusion stage at
+        // 0.64 ms p50 (run 35761020588). An in-memory content-hash key on the
+        // id mapping was considered and is not worth its schema change.
         let mut results: Vec<_> = scores.into_iter().collect();
         results.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        crate::memory::order_ties_by_content(
+            &mut results,
+            |a, b| a.1.to_bits() == b.1.to_bits(),
+            |x| x.0.clone(),
+            &get_content,
+        );
 
         results
     }
@@ -658,6 +895,11 @@ impl HybridSearchEngine {
     /// Commit batches lost after retries — see [`BM25Index::commit_failure_count`].
     pub fn bm25_commit_failure_count(&self) -> u64 {
         self.bm25_index.commit_failure_count()
+    }
+
+    /// BM25 document inserts lost. See [`BM25Index::index_failure_count`].
+    pub fn bm25_index_failure_count(&self) -> u64 {
+        self.bm25_index.index_failure_count()
     }
 
     /// Merge BM25 segments to remove ghost state and reclaim space.
@@ -801,7 +1043,7 @@ impl HybridSearchEngine {
         &self,
         query: &str,
         vector_results: Vec<(MemoryId, f32)>,
-        _get_content: F,
+        get_content: F,
         term_weights: Option<&HashMap<String, f32>>,
         phrase_boosts: Option<&[(String, f32)]>,
         keyword_discriminativeness: Option<f32>,
@@ -824,6 +1066,13 @@ impl HybridSearchEngine {
             .into_iter()
             .filter(|(_, score)| *score >= self.config.min_bm25_score)
             .collect();
+        // The lexical leg as fusion sees it. Recorded here because nothing
+        // downstream keeps the BM25 order; without this stage a hybrid-leg
+        // divergence could not be told apart from a BM25 one.
+        crate::memory::gold_funnel::record_scored(
+            "bm25",
+            bm25_results.iter().map(|(id, score)| (id, *score)),
+        );
 
         // Calculate dynamic weights based on keyword discriminativeness
         // When YAKE identifies discriminative keywords, trust BM25 more
@@ -868,7 +1117,10 @@ impl HybridSearchEngine {
         // 2. RRF Fusion with dynamic weights
         let rrf = RRFusion::new(self.config.rrf_k, vec![bm25_weight, vector_weight]);
 
-        let fused = rrf.fuse(vec![bm25_results.clone(), vector_results.clone()]);
+        let fused = rrf.fuse(
+            vec![bm25_results.clone(), vector_results.clone()],
+            &get_content,
+        );
 
         // Build lookup maps for component scores
         let bm25_map: HashMap<MemoryId, (f32, usize)> = bm25_results
@@ -912,15 +1164,20 @@ impl HybridSearchEngine {
         self.bm25_index.len()
     }
 
-    /// Check if BM25 index is empty (needs backfill)
+    /// Whether the BM25 index must be (re)filled from long-term storage: it is
+    /// empty, or a previous backfill never finished.
     pub fn needs_backfill(&self) -> bool {
-        self.bm25_index.is_empty()
+        self.bm25_index.is_empty() || self.bm25_index.backfill_pending()
     }
 
     /// Backfill BM25 index from existing memories
     ///
-    /// Call this on startup if the BM25 index is empty but memories exist.
-    /// This indexes all memories into BM25 for hybrid search.
+    /// Call this on startup when [`Self::needs_backfill`] is true. It indexes
+    /// every memory given, and is safe to repeat: `upsert` replaces by id, so
+    /// re-running after an interruption converges instead of duplicating.
+    /// The pending marker is set before the first write and cleared only after
+    /// the final commit and reload, so an interrupted run is retried on the
+    /// next start.
     ///
     /// # Arguments
     /// * `memories` - Iterator of (memory_id, content, tags, entities)
@@ -931,6 +1188,8 @@ impl HybridSearchEngine {
     where
         I: Iterator<Item = (MemoryId, String, Vec<String>, Vec<String>)>,
     {
+        self.bm25_index.begin_backfill()?;
+
         let mut count = 0;
         let mut batch_count = 0;
         const BATCH_SIZE: usize = 100;
@@ -957,6 +1216,7 @@ impl HybridSearchEngine {
         // Reload reader to see new documents
         self.bm25_index.reload()?;
 
+        self.bm25_index.finish_backfill()?;
         info!("BM25 backfill complete: indexed {} memories", count);
         Ok(count)
     }
@@ -965,6 +1225,102 @@ impl HybridSearchEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Index `n` documents that all score identically for `keyword`, one
+    /// commit per document as `remember` does it, so the index is many
+    /// segments in whatever order tantivy's segment register drew.
+    fn index_tied_corpus(path: &Path, n: usize) -> (BM25Index, HashMap<MemoryId, String>) {
+        let index = BM25Index::new(path).expect("create");
+        let mut contents = HashMap::with_capacity(n);
+        for i in 0..n {
+            let id = MemoryId(uuid::Uuid::new_v4());
+            // Same term frequency and the same length for every document:
+            // bit-identical BM25 scores, distinct text.
+            let content = format!("keyword filler{i:03}");
+            index.upsert(&id, &content, &[], &[]).expect("upsert");
+            index.commit().expect("commit");
+            contents.insert(id, content);
+        }
+        index.reload().expect("reload");
+        (index, contents)
+    }
+
+    /// Two ingests of one corpus must cut a BM25 tie the same way. Before the
+    /// stable cut, which tied documents survived the cut was decided by the
+    /// segment order behind `DocAddress`, which is a `HashMap` order in
+    /// tantivy and so differed between the two builds.
+    #[test]
+    fn bm25_cut_through_a_tie_is_decided_by_the_corpus_not_the_segment_layout() {
+        let home = tempfile::tempdir().expect("tempdir");
+        const DOCS: usize = 150;
+        const LIMIT: usize = 100;
+
+        let (first, first_contents) = index_tied_corpus(&home.path().join("first"), DOCS);
+        let (second, second_contents) = index_tied_corpus(&home.path().join("second"), DOCS);
+
+        let cut = |index: &BM25Index, contents: &HashMap<MemoryId, String>| -> Vec<String> {
+            index
+                .search("keyword", LIMIT)
+                .expect("search")
+                .into_iter()
+                .map(|(id, _)| contents[&id].clone())
+                .collect()
+        };
+        let first_cut = cut(&first, &first_contents);
+        let second_cut = cut(&second, &second_contents);
+
+        assert_eq!(
+            first_cut.len(),
+            LIMIT,
+            "precondition: more matches than the limit"
+        );
+        assert_eq!(
+            first_cut, second_cut,
+            "the same corpus and query kept different documents through the cut"
+        );
+        let expected: Vec<String> = (0..LIMIT)
+            .map(|i| format!("keyword filler{i:03}"))
+            .collect();
+        assert_eq!(first_cut, expected, "ties are ordered by content");
+    }
+
+    /// A backfill that dies after its first batch commit leaves an index that
+    /// is non-empty and incomplete. `is_empty` then says nothing is owed, so the
+    /// rest of the corpus would never be indexed. The pending marker has to
+    /// survive the process and say otherwise until a backfill finishes.
+    #[test]
+    fn an_interrupted_backfill_stays_pending_across_a_reopen() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let path = home.path().join("bm25_index");
+
+        {
+            let index = BM25Index::new(&path).expect("create");
+            index.begin_backfill().expect("begin");
+            index
+                .upsert(&MemoryId(uuid::Uuid::new_v4()), "first batch", &[], &[])
+                .expect("upsert");
+            index.commit().expect("commit");
+            // The process dies here: no final commit, no finish_backfill.
+        }
+
+        let reopened = BM25Index::new(&path).expect("reopen");
+        reopened.reload().expect("reload");
+        assert!(
+            !reopened.is_empty(),
+            "precondition: the first batch reached disk, so emptiness alone cannot \
+             see the interruption"
+        );
+        assert!(
+            reopened.backfill_pending(),
+            "an interrupted backfill must still read as pending after a restart"
+        );
+
+        reopened.finish_backfill().expect("finish");
+        assert!(!reopened.backfill_pending());
+        reopened
+            .finish_backfill()
+            .expect("finishing twice is not an error");
+    }
 
     #[test]
     fn test_rrf_fusion_basic() {
@@ -980,7 +1336,7 @@ mod tests {
         // List 2: id2 > id1 > id3
         let list2 = vec![(id2.clone(), 0.95), (id1.clone(), 0.6), (id3.clone(), 0.4)];
 
-        let fused = rrf.fuse(vec![list1, list2]);
+        let fused = rrf.fuse(vec![list1, list2], |_| None);
 
         // id1 and id2 have symmetric ranks (1,2) and (2,1), so they should have equal RRF scores
         // The ordering between them is implementation-defined, but both should be above id3
@@ -1021,7 +1377,7 @@ mod tests {
         let list1 = vec![(id1.clone(), 0.9)];
         let list2 = vec![(id2.clone(), 0.8)];
 
-        let fused = rrf.fuse(vec![list1, list2]);
+        let fused = rrf.fuse(vec![list1, list2], |_| None);
 
         assert_eq!(fused.len(), 2);
         // Both should have same RRF score (rank 1 in their respective list)
@@ -1041,7 +1397,11 @@ mod tests {
         assert!(lo < hi, "fixture ordering precondition");
 
         // Two disjoint single-item lists → identical RRF score (rank 0 in each).
-        let fused = rrf.fuse(vec![vec![(hi.clone(), 0.9)], vec![(lo.clone(), 0.1)]]);
+        // No content resolvable: the id fallback decides.
+        let fused = rrf.fuse(
+            vec![vec![(hi.clone(), 0.9)], vec![(lo.clone(), 0.1)]],
+            |_| None,
+        );
 
         assert_eq!(fused.len(), 2);
         assert!(
@@ -1053,6 +1413,59 @@ mod tests {
             "tie must resolve to the lower MemoryId first"
         );
         assert_eq!(fused[1].0, hi);
+    }
+
+    /// Two ingests of one corpus draw different ids for the same texts. A
+    /// tie in RRF has to come out in the same CONTENT order both times, or
+    /// the fusion downstream ranks the same corpus differently per ingest.
+    #[test]
+    fn rrf_ties_come_out_in_the_same_content_order_whatever_the_ids() {
+        let rrf = RRFusion::new(60.0, vec![0.5, 0.5]);
+        // Ranks are identical across the two "ingests"; only the ids differ,
+        // and they are chosen so the id order is REVERSED between them.
+        let ingests = [
+            (
+                MemoryId(uuid::Uuid::from_bytes([0x00; 16])),
+                MemoryId(uuid::Uuid::from_bytes([0xff; 16])),
+            ),
+            (
+                MemoryId(uuid::Uuid::from_bytes([0xff; 16])),
+                MemoryId(uuid::Uuid::from_bytes([0x00; 16])),
+            ),
+        ];
+        let orders: Vec<Vec<&str>> = ingests
+            .iter()
+            .map(|(zebra, apple)| {
+                let content = |id: &MemoryId| -> Option<String> {
+                    if id == zebra {
+                        Some("zebra".to_string())
+                    } else if id == apple {
+                        Some("apple".to_string())
+                    } else {
+                        None
+                    }
+                };
+                // Disjoint single-item lists: an exact RRF tie.
+                let fused = rrf.fuse(
+                    vec![vec![(zebra.clone(), 0.9)], vec![(apple.clone(), 0.1)]],
+                    content,
+                );
+                assert!(
+                    (fused[0].1 - fused[1].1).abs() < f32::EPSILON,
+                    "scores must tie for this to exercise the tie-break"
+                );
+                fused
+                    .iter()
+                    .map(|(id, _)| if id == zebra { "zebra" } else { "apple" })
+                    .collect()
+            })
+            .collect();
+        assert_eq!(orders[0], orders[1], "the id draw decided the order");
+        assert_eq!(
+            orders[0],
+            vec!["apple", "zebra"],
+            "ties are ordered by content"
+        );
     }
 
     #[test]
@@ -1183,11 +1596,12 @@ mod tests {
         let vector_list = vec![(id2.clone(), 0.95), (id1.clone(), 0.6)];
 
         // With BM25 weighted higher, id1 should win
-        let fused_bm25 = rrf_bm25_heavy.fuse(vec![bm25_list.clone(), vector_list.clone()]);
+        let fused_bm25 =
+            rrf_bm25_heavy.fuse(vec![bm25_list.clone(), vector_list.clone()], |_| None);
         assert_eq!(fused_bm25[0].0, id1, "BM25-heavy should favor BM25 winner");
 
         // With vector weighted higher, id2 should win
-        let fused_vector = rrf_vector_heavy.fuse(vec![bm25_list, vector_list]);
+        let fused_vector = rrf_vector_heavy.fuse(vec![bm25_list, vector_list], |_| None);
         assert_eq!(
             fused_vector[0].0, id2,
             "Vector-heavy should favor vector winner"
@@ -1211,8 +1625,8 @@ mod tests {
         let list1 = vec![(id1.clone(), 0.9), (id2.clone(), 0.7), (id3.clone(), 0.5)];
         let list2 = vec![(id3.clone(), 0.9), (id2.clone(), 0.7), (id1.clone(), 0.5)];
 
-        let fused_low_k = rrf_low_k.fuse(vec![list1.clone(), list2.clone()]);
-        let fused_high_k = rrf_high_k.fuse(vec![list1, list2]);
+        let fused_low_k = rrf_low_k.fuse(vec![list1.clone(), list2.clone()], |_| None);
+        let fused_high_k = rrf_high_k.fuse(vec![list1, list2], |_| None);
 
         // With low k, rank differences matter more
         // With high k, id2 (consistent #2) should do relatively better

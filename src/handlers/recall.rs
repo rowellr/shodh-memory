@@ -329,6 +329,15 @@ pub struct ReinforceFeedbackResponse {
     pub associations_strengthened: usize,
     pub importance_boosts: usize,
     pub importance_decays: usize,
+    /// Memory-to-memory edges minted or strengthened because this set was
+    /// confirmed useful. Zero unless SHODH_COACT_OUTCOME_GATED=1 and the
+    /// outcome was "helpful" — see `record_memory_coactivation_outcome`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub coactivation_edges: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 // =============================================================================
@@ -507,10 +516,16 @@ pub async fn recall(
     let user_id_for_recall = req.user_id.clone();
     let query_for_recall = req.query.clone();
     let debug_mode = req.debug;
+    let read_only_for_recall = req.read_only;
     let neural_ner_for_recall = state.get_neural_ner();
 
-    let (mut memories, triggered_reminders, _prospective_signals, retrieval_stats) =
-        tokio::task::spawn_blocking(move || {
+    let (
+        mut memories,
+        triggered_reminders,
+        _prospective_signals,
+        retrieval_stats,
+        reinforcement_applied,
+    ) = tokio::task::spawn_blocking(move || {
             let memory_guard = memory_for_recall.read();
 
             // 1. Compute query embedding (reused for prospective + recall)
@@ -595,9 +610,16 @@ pub async fn recall(
                 terrain_type: terrain_type_for_recall,
                 tags: tags_for_recall,
                 layers: layer_mode_for_recall,
+                read_only: read_only_for_recall,
                 ..Default::default()
             };
             super::state::annotate_query_ner_with(&neural_ner_for_recall, &mut query);
+
+            // Derived from the gate the mutation sites consult, not from
+            // `req.read_only`: a server running under the process-wide
+            // SHODH_RECALL_READONLY pin performs no usage writes even for a
+            // caller that sent no flag, and the response must say so.
+            let reinforcement_applied = !crate::memory::recall_is_readonly(&query);
 
             let (memories, retrieval_stats) = if debug_mode {
                 let result = memory_guard
@@ -611,7 +633,13 @@ pub async fn recall(
                 (memories, None)
             };
 
-            Ok::<_, anyhow::Error>((memories, reminders, prospective_signals, retrieval_stats))
+            Ok::<_, anyhow::Error>((
+                memories,
+                reminders,
+                prospective_signals,
+                retrieval_stats,
+                reinforcement_applied,
+            ))
         })
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
@@ -824,6 +852,7 @@ pub async fn recall(
                     tags: m.experience.entities.clone(),
                     geo_location: m.experience.geo_location,
                     toponyms: m.experience.toponyms.clone(),
+                    origin: m.experience.origin.as_str().to_string(),
                 },
                 importance: m.importance(),
                 created_at: m.created_at.to_rfc3339(),
@@ -950,7 +979,11 @@ pub async fn recall(
             unique_facts.entry(fact.id.clone()).or_insert(fact);
         }
         let mut sorted_facts: Vec<RecallFact> = unique_facts.into_values().collect();
-        sorted_facts.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
+        sorted_facts.sort_by(|a, b| {
+            b.confidence
+                .total_cmp(&a.confidence)
+                .then_with(|| a.id.cmp(&b.id))
+        });
         sorted_facts.truncate(5);
         sorted_facts
     };
@@ -1150,6 +1183,7 @@ pub async fn recall(
         reminder_count,
         lineage,
         lineage_count,
+        reinforcement_applied,
     }))
 }
 
@@ -2228,7 +2262,7 @@ pub async fn proactive_context(
                 .collect();
 
             // Sort by boosted score (highest first)
-            enriched.sort_by(|a, b| b.1.total_cmp(&a.1));
+            enriched.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.id.cmp(&b.0.id)));
 
             // --- Adaptive involuntary memory constraints (Berntsen 2009) ---
             // These operate ONLY on proactive_context, not voluntary recall.
@@ -2255,7 +2289,7 @@ pub async fn proactive_context(
                         .max(ELABORATION_QUALITY_MIN);
                     *score *= quality;
                 }
-                enriched.sort_by(|a, b| b.1.total_cmp(&a.1));
+                enriched.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.id.cmp(&b.0.id)));
             }
 
             // (B) Steeper proactive recency — involuntary memories favor recent events.
@@ -2272,7 +2306,7 @@ pub async fn proactive_context(
                     let proactive_recency_factor = (-differential_rate * hours_old).exp();
                     *score *= proactive_recency_factor;
                 }
-                enriched.sort_by(|a, b| b.1.total_cmp(&a.1));
+                enriched.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.id.cmp(&b.0.id)));
             }
 
             // (C) Habituation — penalize memories surfaced repeatedly without utility.
@@ -2294,7 +2328,7 @@ pub async fn proactive_context(
                         }
                     }
                 }
-                enriched.sort_by(|a, b| b.1.total_cmp(&a.1));
+                enriched.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.id.cmp(&b.0.id)));
             }
 
             // (D) Lateral inhibition — similar candidates suppress each other.
@@ -2325,7 +2359,7 @@ pub async fn proactive_context(
                     }
                 }
                 // Final sort after all biological constraints applied
-                enriched.sort_by(|a, b| b.1.total_cmp(&a.1));
+                enriched.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.id.cmp(&b.0.id)));
             }
 
             // Normalize scores before applying the public threshold. Raw pipeline scores are
@@ -2530,6 +2564,10 @@ pub async fn proactive_context(
                                     None,
                                     None,
                                 ),
+                                // Nobody asked for this to be stored: it is the
+                                // previous assistant turn, captured because
+                                // `auto_ingest` defaults to true.
+                                origin: crate::memory::types::MemoryOrigin::AutoIngest,
                                 ..Default::default()
                             };
                             let _ = memory_guard.remember(experience, None);
@@ -2603,6 +2641,7 @@ pub async fn proactive_context(
                             None,
                             None,
                         ),
+                        origin: crate::memory::types::MemoryOrigin::AutoIngest,
                         ..Default::default()
                     };
                     if let Ok(id) = memory_guard.remember(experience, None) {
@@ -2854,7 +2893,11 @@ pub async fn proactive_context(
                 }
                 // Deduplicate by text similarity: if two facts share >80% words, keep higher confidence
                 let mut sorted: Vec<ProactiveFact> = found.into_values().collect();
-                sorted.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
+                sorted.sort_by(|a, b| {
+                    b.confidence
+                        .total_cmp(&a.confidence)
+                        .then_with(|| a.id.cmp(&b.id))
+                });
                 let mut deduped: Vec<ProactiveFact> = Vec::new();
                 for fact in sorted {
                     let fact_words: std::collections::HashSet<&str> =
@@ -3178,6 +3221,7 @@ pub async fn recall_tracked(
                     tags: m.experience.entities.clone(),
                     geo_location: m.experience.geo_location,
                     toponyms: m.experience.toponyms.clone(),
+                    origin: m.experience.origin.as_str().to_string(),
                 },
                 importance: m.importance(),
                 created_at: m.created_at.to_rfc3339(),
@@ -3234,6 +3278,7 @@ pub async fn reinforce_feedback(
             associations_strengthened: 0,
             importance_boosts: 0,
             importance_decays: 0,
+            coactivation_edges: 0,
         }));
     }
 
@@ -3279,6 +3324,10 @@ pub async fn reinforce_feedback(
         .map_err(AppError::Internal)?
     };
 
+    // Memory-to-memory edges minted because this set was confirmed useful.
+    // Stays 0 unless the outcome-gated path below runs.
+    let mut coactivation_edges = 0usize;
+
     // Propagate feedback to entity salience in the knowledge graph
     if let Some(graph) = graph {
         let boost = match outcome {
@@ -3311,6 +3360,51 @@ pub async fn reinforce_feedback(
                 Err(e) => tracing::warn!("Entity reinforcement task panicked: {}", e),
             }
         }
+
+        // OUTCOME-GATED memory-to-memory Hebbian update.
+        //
+        // The recall path calls record_memory_coactivation on every retrieval
+        // and is strengthen-only, so it mints nothing and the mem<->mem layer
+        // has been inert since f6b730ee. That gate was correct: un-gated
+        // all-pairs minting over a full retrieval was ~80% of graph edges and
+        // the OOM driver, and the resulting hub bias cost 6.7pp of p@1.
+        //
+        // This is the same rule with a reward attached. It fires only on an
+        // explicit "helpful" outcome over the exact set the caller had evidence
+        // for, which is what makes minting affordable: a citation set is a
+        // handful of memories, so all-pairs is single-digit edges rather than
+        // ~1,225 for a top-50 retrieval.
+        //
+        // DEFAULT OFF. It has to beat the ablation on the pinned harness —
+        // p@1/MRR up, recall@10 identity held, effect several times run noise —
+        // before it earns a default, exactly as the retrieval-gated version
+        // failed to.
+        let outcome_gated = std::env::var("SHODH_COACT_OUTCOME_GATED")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        if outcome_gated && matches!(outcome, crate::memory::RetrievalOutcome::Helpful) {
+            let graph_clone = graph.clone();
+            let uuids = memory_uuids.clone();
+            let cited_count = uuids.len();
+            match tokio::task::spawn_blocking(move || {
+                let graph_guard = graph_clone.read();
+                graph_guard.record_memory_coactivation_outcome(&uuids)
+            })
+            .await
+            {
+                Ok(Ok(count)) => {
+                    coactivation_edges = count;
+                    tracing::info!(
+                        coactivation_edges = count,
+                        cited = cited_count,
+                        "Outcome-gated coactivation applied"
+                    );
+                }
+                Ok(Err(e)) => tracing::warn!("Outcome-gated coactivation failed: {}", e),
+                Err(e) => tracing::warn!("Outcome-gated coactivation task panicked: {}", e),
+            }
+        }
     }
 
     tracing::info!(
@@ -3337,6 +3431,7 @@ pub async fn reinforce_feedback(
         associations_strengthened: stats.associations_strengthened,
         importance_boosts: stats.importance_boosts,
         importance_decays: stats.importance_decays,
+        coactivation_edges,
     }))
 }
 
@@ -3484,6 +3579,11 @@ pub struct PaginatedRecallResponse {
     pub total_count: Option<usize>,
     pub offset: usize,
     pub limit: usize,
+    /// Whether this recall reinforced what it read. Same contract as
+    /// [`crate::handlers::types::RecallResponse::reinforcement_applied`]:
+    /// derived from the gate the mutation sites consulted, never echoed back
+    /// from the request.
+    pub reinforcement_applied: bool,
 }
 
 /// POST /api/recall/paginated - Paginated memory recall
@@ -3552,11 +3652,17 @@ pub async fn paginated_recall(
     let terrain_type = req.terrain_type.clone();
     let tags = req.tags.clone();
     let failures_only = req.failures_only.unwrap_or(false);
+    // This endpoint shares `RecallRequest`, so it already ACCEPTS `read_only`.
+    // Parsing the flag and then not honouring it would be worse than not
+    // offering it: the caller sees a documented field, sends it, and still gets
+    // a recall that reinforced what it read.
+    let read_only = req.read_only;
 
-    let paginated = tokio::task::spawn_blocking(move || {
+    let (paginated, reinforcement_applied) = tokio::task::spawn_blocking(move || {
         let memory_guard = memory.read();
 
         let query = MemoryQuery {
+            read_only,
             user_id: Some(user_id),
             query_text: Some(query_text),
             max_results: limit,
@@ -3575,7 +3681,12 @@ pub async fn paginated_recall(
             ..Default::default()
         };
 
-        memory_guard.paginated_recall(&query)
+        // Derived from the gate the mutation sites consult, so it stays honest
+        // under the process-wide SHODH_RECALL_READONLY pin.
+        let reinforcement_applied = !crate::memory::recall_is_readonly(&query);
+        memory_guard
+            .paginated_recall(&query)
+            .map(|p| (p, reinforcement_applied))
     })
     .await
     .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
@@ -3594,6 +3705,7 @@ pub async fn paginated_recall(
                     tags: m.experience.entities.clone(),
                     geo_location: m.experience.geo_location,
                     toponyms: m.experience.toponyms.clone(),
+                    origin: m.experience.origin.as_str().to_string(),
                 },
                 importance: m.importance(),
                 created_at: m.created_at.to_rfc3339(),
@@ -3620,6 +3732,7 @@ pub async fn paginated_recall(
         total_count: paginated.total_count,
         offset: paginated.offset,
         limit: paginated.limit,
+        reinforcement_applied,
     }))
 }
 

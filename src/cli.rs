@@ -558,7 +558,14 @@ fn handle_init() -> Result<()> {
         );
         std::fs::write(&config_path, config_content)?;
         eprintln!("  ✓ Config created: {}", config_path.display());
-        eprintln!("  ✓ API key generated: {}", api_key);
+        // The full key was just written to the config file with restricted permissions — that is
+        // where the user retrieves it. Printing it here lands it in every captured stderr, shell
+        // transcript and CI log this command runs under, so only a recognisable prefix is shown.
+        eprintln!(
+            "  ✓ API key generated: {}… (full key stored in {})",
+            api_key.get(..12).unwrap_or("sk-shodh"),
+            config_path.display()
+        );
     }
 
     // 3. Pre-download ONNX runtime + embedding model
@@ -568,6 +575,15 @@ fn handle_init() -> Result<()> {
     eprintln!();
     shodh_memory::embeddings::minilm::pre_init_ort_runtime(false);
     eprintln!("  ✓ ONNX runtime ready");
+
+    // The server reranks recall with this model by default (SHODH_CE_RERANK=0
+    // opts out), so fetch it here rather than on first server start.
+    match shodh_memory::embeddings::cross_encoder::ensure_assets() {
+        Ok(dir) => eprintln!("  ✓ Cross-encoder reranker ready ({})", dir.display()),
+        Err(e) => eprintln!(
+            "  ! Cross-encoder reranker not downloaded ({e}); the server retries on start"
+        ),
+    }
 
     // 4. Print next steps
     eprintln!();
